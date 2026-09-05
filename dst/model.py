@@ -23,6 +23,23 @@ gather_output=True; padding logits are sliced off before the loss so they
 get zero gradient. Weight tying with wte is deliberately skipped: the head
 holds a vocab shard while the embedding is replicated.
 
+SP has one cost the conjugate operators don't cover: replicated params
+that consume sequence-sharded activations (LayerNorm weights/biases,
+row-parallel biases added after the reduce-scatter) see only their rank's
+sequence chunk in backward, so their gradients come out partial. They are
+tagged at construction and allreduce_sequence_parallel_grads() must run
+after backward, before the optimizer step. (Embedding grads are NOT
+affected: the scatter's backward all-gathers, restoring full gradients.)
+
+With config.sequence_parallel set, the regions between TP blocks —
+LayerNorm, dropout, residual adds — run on activations sharded along the
+sequence axis: the embedding output is scattered along seq, every
+column-parallel entry becomes g (all-gather seq) and every row-parallel
+exit becomes g-bar (reduce-scatter seq), so nothing outside the matmuls
+ever holds a full b*s*h tensor. Inside the TP region the sequence is full
+— attention needs every key and value. The math is identical to plain TP;
+only where activations live changes.
+
 Every submodule takes a TPContext; built with parallel.SINGLE this is
 plain single-process PyTorch.
 """
@@ -31,11 +48,13 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .parallel import TPContext
 from .layers import ColumnParallelLinear, RowParallelLinear
+from .ops import scatter_along_seq
 
 VOCAB_PAD_MULTIPLE = 128
 
@@ -48,6 +67,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
+    sequence_parallel: bool = False
 
 
 def _pad_vocab(vocab_size: int) -> int:
@@ -64,18 +84,34 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         # GPT-2 scales residual-path projections by 1/sqrt(2L).
         proj_std = 0.02 / math.sqrt(2 * config.n_layer)
-        self.q = ColumnParallelLinear(config.n_embd, config.n_embd, tp, generator=generator)
-        self.k = ColumnParallelLinear(config.n_embd, config.n_embd, tp, generator=generator)
-        self.v = ColumnParallelLinear(config.n_embd, config.n_embd, tp, generator=generator)
+        in_mode = "sequence" if config.sequence_parallel else "replicated"
+        self.q = ColumnParallelLinear(
+            config.n_embd, config.n_embd, tp, input_mode=in_mode, generator=generator
+        )
+        self.k = ColumnParallelLinear(
+            config.n_embd, config.n_embd, tp, input_mode=in_mode, generator=generator
+        )
+        self.v = ColumnParallelLinear(
+            config.n_embd, config.n_embd, tp, input_mode=in_mode, generator=generator
+        )
         self.proj = RowParallelLinear(
-            config.n_embd, config.n_embd, tp, init_std=proj_std, generator=generator
+            config.n_embd,
+            config.n_embd,
+            tp,
+            output_mode=in_mode,
+            init_std=proj_std,
+            generator=generator,
         )
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, _ = x.shape
+        # Under sequence parallelism x arrives sequence-sharded; the q/k/v
+        # projections all-gather it, so T comes from their output, not x.
+        B = x.shape[0]
         h, d = self.n_head_local, self.head_dim
-        q = self.q(x).view(B, T, h, d).transpose(1, 2)
+        q = self.q(x)
+        T = q.shape[1]
+        q = q.view(B, T, h, d).transpose(1, 2)
         k = self.k(x).view(B, T, h, d).transpose(1, 2)
         v = self.v(x).view(B, T, h, d).transpose(1, 2)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -87,9 +123,17 @@ class MLP(nn.Module):
     def __init__(self, config: GPTConfig, tp: TPContext, generator: torch.Generator):
         super().__init__()
         proj_std = 0.02 / math.sqrt(2 * config.n_layer)
-        self.c_fc = ColumnParallelLinear(config.n_embd, 4 * config.n_embd, tp, generator=generator)
+        mode = "sequence" if config.sequence_parallel else "replicated"
+        self.c_fc = ColumnParallelLinear(
+            config.n_embd, 4 * config.n_embd, tp, input_mode=mode, generator=generator
+        )
         self.c_proj = RowParallelLinear(
-            4 * config.n_embd, config.n_embd, tp, init_std=proj_std, generator=generator
+            4 * config.n_embd,
+            config.n_embd,
+            tp,
+            output_mode=mode,
+            init_std=proj_std,
+            generator=generator,
         )
         self.dropout = nn.Dropout(config.dropout)
 
@@ -133,13 +177,35 @@ class GPT(nn.Module):
             tp,
             bias=False,
             gather_output=True,
+            input_mode="sequence" if config.sequence_parallel else "replicated",
             generator=generator,
         )
+
+        if config.sequence_parallel:
+            for m in self.modules():
+                if isinstance(m, nn.LayerNorm):
+                    for p in m.parameters():
+                        p.sequence_parallel_replicated = True
+
+    def finalize_grads(self) -> None:
+        """All-reduce the partial gradients of replicated params that live in
+        sequence-sharded regions. Call after backward, before the optimizer
+        step. No-op without sequence parallelism."""
+        if not (self.config.sequence_parallel and self.tp.enabled):
+            return
+        for p in self.parameters():
+            if getattr(p, "sequence_parallel_replicated", False) and p.grad is not None:
+                dist.all_reduce(p.grad, group=self.tp.group)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
-        x = self.drop(self.wte(idx) + self.wpe(pos))
+        x = self.wte(idx) + self.wpe(pos)
+        if self.config.sequence_parallel:
+            if T % self.tp.world != 0:
+                raise ValueError(f"seq len {T} not divisible by tp {self.tp.world}")
+            x = scatter_along_seq(x, self.tp)
+        x = self.drop(x)
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)

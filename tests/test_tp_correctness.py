@@ -28,12 +28,20 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import argparse
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
 from dst import parallel
-from dst.ops import copy_to_tp_region, reduce_from_tp_region
+from dst.ops import (
+    copy_to_tp_region,
+    reduce_from_tp_region,
+    gather_along_seq,
+    reduce_scatter_along_seq,
+    scatter_along_seq,
+)
 from dst.layers import ColumnParallelLinear, RowParallelLinear
 from dst.model import GPT, GPTConfig
 
@@ -78,6 +86,38 @@ def test_conjugacy(tp):
     Z.sum().backward()
 
     ok = check(tp, "forward Z", Z, Z_ref)
+    ok &= check(tp, "grad X", Xp.grad, X.grad)
+    ok &= check(tp, "grad A shard", Ai.grad, A.grad[:, tp.rank * h_local : (tp.rank + 1) * h_local])
+    ok &= check(tp, "grad B shard", Bi.grad, B.grad[tp.rank * h_local : (tp.rank + 1) * h_local, :])
+    return ok
+
+
+def test_sp_conjugacy(tp):
+    """g / g-bar with a column+row split against the unsplit computation,
+    input and output sequence-sharded, checking outputs and gradients."""
+    log(tp, "conjugacy: g / g-bar on a sequence-sharded column+row split")
+    g = torch.Generator().manual_seed(SEED)
+    b, s, n, h = 2, 8, 6, 12
+    X = torch.randn(b, s, n, generator=g, requires_grad=True)
+    A = torch.randn(n, h, generator=g, requires_grad=True)
+    B = torch.randn(h, n, generator=g, requires_grad=True)
+
+    Z_ref = F.gelu(X @ A) @ B
+    Z_ref.sum().backward()
+
+    h_local = h // tp.world
+    s_local = s // tp.world
+    Xp = X.detach().clone().requires_grad_(True)
+    Ai = A.detach()[:, tp.rank * h_local : (tp.rank + 1) * h_local].clone().requires_grad_(True)
+    Bi = B.detach()[tp.rank * h_local : (tp.rank + 1) * h_local, :].clone().requires_grad_(True)
+
+    x_shard = scatter_along_seq(Xp, tp)          # enter the sharded region
+    Y_i = F.gelu(gather_along_seq(x_shard, tp) @ Ai)   # g: full seq inside
+    Z_shard = reduce_scatter_along_seq(Y_i @ Bi, tp)   # g-bar: sharded out
+    Z_shard.sum().backward()
+
+    z_ref_shard = Z_ref[:, tp.rank * s_local : (tp.rank + 1) * s_local, :]
+    ok = check(tp, "forward Z shard", Z_shard, z_ref_shard)
     ok &= check(tp, "grad X", Xp.grad, X.grad)
     ok &= check(tp, "grad A shard", Ai.grad, A.grad[:, tp.rank * h_local : (tp.rank + 1) * h_local])
     ok &= check(tp, "grad B shard", Bi.grad, B.grad[tp.rank * h_local : (tp.rank + 1) * h_local, :])
@@ -139,6 +179,7 @@ def test_model(tp, model_tp, model_ref, cfg):
 
     log(tp, "backward: every gradient shard vs the reference slice")
     loss_tp.backward()
+    model_tp.finalize_grads()
     loss_ref.backward()
     worst_name, worst = None, -1.0
     for name, p in model_tp.named_parameters():
@@ -171,6 +212,7 @@ def test_training(tp, model_tp, model_ref, cfg, steps=10):
         opt_tp.zero_grad(set_to_none=True)
         opt_ref.zero_grad(set_to_none=True)
         loss_tp.backward()
+        model_tp.finalize_grads()
         loss_ref.backward()
         opt_tp.step()
         opt_ref.step()
@@ -181,18 +223,52 @@ def test_training(tp, model_tp, model_ref, cfg, steps=10):
     return ok and fell
 
 
+def test_seq_sharding(tp, model_tp, cfg):
+    """With SP on, activations entering every LayerNorm must be
+    sequence-sharded: [B, T/tp, C], not [B, T, C]."""
+    log(tp, "sharding: LayerNorm-region activations are [B, T/tp, C]")
+    seen = []
+    hooks = [
+        b.ln_1.register_forward_hook(lambda m, args, out: seen.append(args[0].shape))
+        for b in model_tp.blocks
+    ]
+    idx, targets = make_batch(cfg, torch.Generator().manual_seed(SEED + 1))
+    with torch.no_grad():
+        model_tp(idx, targets)
+    for h in hooks:
+        h.remove()
+    want = (idx.shape[0], cfg.block_size // tp.world, cfg.n_embd)
+    ok = all(s == torch.Size(want) for s in seen)
+    log(tp, f"  [{'PASS' if ok else 'FAIL'}] {len(seen)} blocks saw {tuple(seen[0])}, want {want}")
+    return ok
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sp", action="store_true", help="enable sequence parallelism")
+    args = parser.parse_args()
+
     parallel.init_distributed()
     torch.manual_seed(SEED)  # dropout etc.; the suite runs with dropout=0
     tp = parallel.make_tp_context()
 
     cfg = GPTConfig(
-        vocab_size=512, block_size=64, n_layer=4, n_head=8, n_embd=128, dropout=0.0
+        vocab_size=512,
+        block_size=64,
+        n_layer=4,
+        n_head=8,
+        n_embd=128,
+        dropout=0.0,
+        sequence_parallel=args.sp,
     )
-    log(tp, f"tp={tp.world}, fp32, cpu, config={cfg}\n")
+    log(tp, f"tp={tp.world}, sp={args.sp}, fp32, cpu, config={cfg}\n")
 
     ok = test_conjugacy(tp)
+    if args.sp:
+        ok &= test_sp_conjugacy(tp)
     model_tp, model_ref = build_models(cfg, tp)
+    if args.sp and tp.enabled:
+        ok &= test_seq_sharding(tp, model_tp, cfg)
     ok &= test_model(tp, model_tp, model_ref, cfg)
     ok &= test_training(tp, model_tp, model_ref, cfg)
 
