@@ -71,7 +71,7 @@ def main():
 
     parallel.init_distributed()
     torch.manual_seed(SEED)
-    tp, pp = parallel.make_topology(args.tp, args.pp)
+    tp, pp, _ = parallel.make_topology(args.tp, args.pp)
 
     cfg = GPTConfig(
         vocab_size=512,

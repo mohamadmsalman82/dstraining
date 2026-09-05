@@ -45,6 +45,10 @@ class PPContext:
     world: int  # number of stages
     prev_rank: Optional[int]  # global rank holding the previous stage
     next_rank: Optional[int]  # global rank holding the next stage
+    # Ring neighbors for the interleaved schedule: same as prev/next but
+    # wrapping around, so always defined (self for world == 1).
+    ring_prev_rank: int = 0
+    ring_next_rank: int = 0
 
     @property
     def is_first(self) -> bool:
@@ -56,6 +60,10 @@ class PPContext:
 
 
 PP_SINGLE = PPContext(rank=0, world=1, prev_rank=None, next_rank=None)
+
+# Data parallelism needs the same (group, rank, world) triple as TP.
+DPContext = TPContext
+DP_SINGLE = SINGLE
 
 
 def init_distributed(backend: Optional[str] = None) -> None:
@@ -114,20 +122,42 @@ def make_tp_context(tp_size: Optional[int] = None) -> TPContext:
     return ctx
 
 
-def make_topology(tp_size: int = 1, pp_size: int = 1):
-    """Decompose the world into (tp, pp) contexts: rank = pp_rank * tp + tp_rank."""
+def make_topology(tp_size: int = 1, pp_size: int = 1, dp_size: int = 1):
+    """Decompose the world into (tp, pp, dp) contexts.
+
+    rank = pp_rank * (tp * dp) + dp_rank * tp + tp_rank — Megatron's order:
+    TP innermost (consecutive ranks, node-local, bandwidth-hungry), DP
+    groups striding by tp within a stage, pipeline neighbors striding by
+    tp * dp (across nodes, tiny p2p traffic).
+    """
     world = dist.get_world_size()
     rank = dist.get_rank()
-    if tp_size * pp_size != world:
-        raise ValueError(f"tp {tp_size} * pp {pp_size} != world {world}")
+    if tp_size * pp_size * dp_size != world:
+        raise ValueError(f"tp {tp_size} * pp {pp_size} * dp {dp_size} != world {world}")
 
     tp = make_tp_context(tp_size)
 
-    pp_rank = rank // tp_size
+    stride = tp_size * dp_size
+    pp_rank = rank // stride
     pp = PPContext(
         rank=pp_rank,
         world=pp_size,
-        prev_rank=rank - tp_size if pp_rank > 0 else None,
-        next_rank=rank + tp_size if pp_rank < pp_size - 1 else None,
+        prev_rank=rank - stride if pp_rank > 0 else None,
+        next_rank=rank + stride if pp_rank < pp_size - 1 else None,
+        ring_prev_rank=rank - pp_rank * stride + ((pp_rank - 1) % pp_size) * stride,
+        ring_next_rank=rank - pp_rank * stride + ((pp_rank + 1) % pp_size) * stride,
     )
-    return tp, pp
+
+    if dp_size == 1:
+        return tp, pp, DP_SINGLE
+
+    dp = None
+    dp_rank = (rank // tp_size) % dp_size
+    for pp_r in range(pp_size):
+        for tp_r in range(tp_size):
+            ranks = [pp_r * stride + d * tp_size + tp_r for d in range(dp_size)]
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                dp = DPContext(group=group, rank=dp_rank, world=dp_size)
+    assert dp is not None
+    return tp, pp, dp

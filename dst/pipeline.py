@@ -220,9 +220,8 @@ class PipelineInterleaved:
         self.fwd_ch = [dist.new_group(everyone) for _ in range(self.v)]
         self.bwd_ch = [dist.new_group(everyone) for _ in range(self.v)]
 
-        g, tp_size, r, p = dist.get_rank(), model.tp.world, pp.rank, pp.world
-        self.ring_next = g - r * tp_size + ((r + 1) % p) * tp_size
-        self.ring_prev = g - r * tp_size + ((r - 1) % p) * tp_size
+        self.ring_next = pp.ring_next_rank
+        self.ring_prev = pp.ring_prev_rank
 
         self.peak_in_flight = 0
 

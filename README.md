@@ -18,7 +18,10 @@ kernel would expand surface area without adding insight.
 - [x] **1F1B pipeline parallelism** (composes with TP and SP)
 - [x] **Interleaved pipeline schedule**
 - [x] **Selective activation recompute**
-- [ ] Data parallelism on top; benchmark against Megatron-LM
+- [x] **Data parallelism on top** — full composition verified: dp2 × pp2 × tp2,
+      interleaved, with SP, on 8 processes
+- [ ] bf16 + fp32 master weights, real data, training run
+- [ ] Benchmark against Megatron-LM (needs GPUs)
 
 ## How tensor parallelism works here
 
@@ -136,6 +139,22 @@ Two implementation choices worth noting (`PipelineInterleaved`):
   warmup depth — the property that separates 1F1B from naive
   all-forward-then-all-backward.
 
+## Data parallelism
+
+The last axis is the simple one: each DP replica holds a full copy of its
+(tp, pp)-sharded model, takes its own slice of the global batch, and after
+backward every gradient is all-reduced and averaged across the DP group
+(`dst/dp.py`). Ranks lay out as `rank = pp·(tp·dp) + dp·tp + tp_rank`, so
+TP stays innermost and node-local, DP groups stride by `tp` within a
+stage, and pipeline neighbors stride by `tp·dp`. What DDP adds beyond this
+is performance engineering — grad bucketing and overlapping the
+all-reduce with backward — which lands with the GPU phase.
+
+The DP suite checks the composition of everything at once: the flagship
+config is `dp2 × pp2 × tp2` with interleaving and sequence parallelism on
+8 processes, where DP-averaged losses, every gradient, and a 5-step Adam
+trajectory match the full-batch single-process reference.
+
 ## Selective recompute
 
 Core attention — `softmax(QKᵀ/√d)·V` — is written by hand and materializes
@@ -168,6 +187,7 @@ dst/layers.py     ColumnParallelLinear, RowParallelLinear
 dst/model.py      GPT-2 from scratch: GPT, GPTStage (one stage), GPTChunks (v chunks)
 dst/pipeline.py   1F1B and interleaved schedules, p2p activation/gradient exchange
 dst/recompute.py  selective activation recompute (custom autograd Function)
+dst/dp.py         data-parallel gradient all-reduce
 tests/            numerical correctness suites
 scripts/          launchers
 ```
@@ -206,6 +226,15 @@ scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 2 --tp 2 --chunks 2 
 
 It checks the pipelined microbatched loss, every accumulated gradient, and
 a 5-step Adam trajectory against the full-batch single-process reference.
+
+The DP suite composes all four axes:
+
+```
+scripts/launch_local.sh 2 tests/test_dp_correctness.py --dp 2
+scripts/launch_local.sh 4 tests/test_dp_correctness.py --dp 2 --tp 2 --sp
+scripts/launch_local.sh 4 tests/test_dp_correctness.py --dp 2 --pp 2 --micro 1
+scripts/launch_local.sh 8 tests/test_dp_correctness.py --dp 2 --pp 2 --tp 2 --chunks 2 --micro 1 --sp
+```
 
 For the TP suite, TP degree = number of processes. The suite checks, in fp32:
 conjugacy of `f`/`f̄` (and `g`/`ḡ` under `--sp`) on a toy split,
