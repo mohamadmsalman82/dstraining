@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 from dst import parallel
 from dst.data import TokenShard, SyntheticShard
-from dst.dp import allreduce_gradients
+from dst.dp import allreduce_gradients, GradReducer
 from dst.model import GPT, GPTConfig, GPTStage, GPTChunks
 from dst.pipeline import Pipeline1F1B, PipelineInterleaved
 from dst.precision import MasterWeightOptimizer
@@ -36,6 +36,9 @@ def parse_args():
     p.add_argument("--sp", action="store_true", help="sequence parallelism")
     p.add_argument("--recompute", action="store_true", help="selective attention recompute")
     p.add_argument("--bf16", action="store_true", help="bf16 params + fp32 master weights")
+    p.add_argument("--vp", action="store_true", help="vocab-parallel cross-entropy")
+    p.add_argument("--naive-dp", action="store_true",
+                   help="per-param blocking grad all-reduce instead of bucketed+overlapped")
     # model (defaults: small; --gpt2 for the real 124M config)
     p.add_argument("--gpt2", action="store_true")
     p.add_argument("--layers", type=int, default=4)
@@ -72,6 +75,7 @@ def main():
         dropout=0.0,
         sequence_parallel=args.sp,
         recompute_attention=args.recompute,
+        vocab_parallel_loss=args.vp,
     )
 
     if args.chunks > 1:
@@ -95,6 +99,10 @@ def main():
         opt = MasterWeightOptimizer(model.parameters(), lr=args.lr)
     else:
         opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    reducer = None
+    if dp.enabled and not args.naive_dp:
+        reducer = GradReducer(model, dp, overlap=(pipe is None))
 
     if args.data == "synthetic":
         shard = SyntheticShard(cfg.vocab_size, cfg.block_size, args.batch, seed=args.seed, dp=dp)
@@ -120,11 +128,16 @@ def main():
         idx, targets = idx.to(device), targets.to(device)
         if pipe is not None:
             loss = pipe.train_step(idx, targets)
+            if reducer is not None:
+                reducer.reduce()
         else:
             _, loss = model(idx, targets)
-            loss.backward()
+            loss.backward()  # overlap-mode reducer buckets ship during this
+        if reducer is not None:
+            reducer.finish()
+        elif dp.enabled:
+            allreduce_gradients(model, dp)
         model.finalize_grads()
-        allreduce_gradients(model, dp)
         opt.step()
 
         if pp.is_last and (step % args.log_every == 0 or step == args.steps - 1):

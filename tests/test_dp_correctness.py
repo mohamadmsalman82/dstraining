@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 
 from dst import parallel
-from dst.dp import allreduce_gradients
+from dst.dp import allreduce_gradients, GradReducer
 from dst.model import GPT, GPTConfig, GPTStage, GPTChunks
 from dst.pipeline import Pipeline1F1B, PipelineInterleaved
 
@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--micro", type=int, default=1)
     parser.add_argument("--sp", action="store_true")
     parser.add_argument("--chunks", type=int, default=1)
+    parser.add_argument("--bucketed", action="store_true",
+                        help="GradReducer (bucketed, overlapped) instead of per-param all-reduce")
     parser.add_argument("--device", default=None, help="cuda|cpu (default: cuda if available)")
     args = parser.parse_args()
 
@@ -91,17 +93,28 @@ def main():
     my_idx = idx[dp.rank * B_local : (dp.rank + 1) * B_local]
     my_tgt = targets[dp.rank * B_local : (dp.rank + 1) * B_local]
 
+    # Small buckets so the bucketed path is exercised across many buckets.
+    reducer = (
+        GradReducer(model, dp, bucket_bytes=1 << 18, overlap=(pipe is None))
+        if args.bucketed else None
+    )
+
     def one_step():
         """Local forward/backward + grad finalization; returns the
         DP-averaged loss on ranks that hold it (last stage), else None."""
         model.zero_grad(set_to_none=True)
         if pipe is not None:
             loss = pipe.train_step(my_idx, my_tgt)
+            if reducer is not None:
+                reducer.reduce()
         else:
             _, loss = model(my_idx, my_tgt)
             loss.backward()
+        if reducer is not None:
+            reducer.finish()
+        else:
+            allreduce_gradients(model, dp)
         model.finalize_grads()
-        allreduce_gradients(model, dp)
         if pp.is_last:
             avg = loss.detach().clone()
             dist.all_reduce(avg, group=dp.group)

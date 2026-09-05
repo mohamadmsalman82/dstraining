@@ -65,7 +65,8 @@ import torch.nn.functional as F
 
 from .parallel import TPContext, PPContext, PP_SINGLE
 from .layers import ColumnParallelLinear, RowParallelLinear
-from .ops import scatter_along_seq
+from .loss import vocab_parallel_cross_entropy
+from .ops import scatter_along_seq, gather_from_tp_region
 from .recompute import recompute
 
 VOCAB_PAD_MULTIPLE = 128
@@ -87,6 +88,11 @@ class GPTConfig:
     dropout: float = 0.0
     sequence_parallel: bool = False
     recompute_attention: bool = False  # selective recompute of core attention
+    # Compute the loss on vocab shards (3 scalar all-reduces) instead of
+    # all-gathering [b, s, padded_vocab] logits — see dst/loss.py. When set,
+    # forward(idx, targets) returns logits=None; full logits are still
+    # produced when called without targets.
+    vocab_parallel_loss: bool = False
 
 
 def _pad_vocab(vocab_size: int) -> int:
@@ -125,14 +131,12 @@ class CausalSelfAttention(nn.Module):
         # GPT-2 scales residual-path projections by 1/sqrt(2L).
         proj_std = 0.02 / math.sqrt(2 * config.n_layer)
         mode = "sequence" if config.sequence_parallel else "replicated"
-        self.q = ColumnParallelLinear(
-            config.n_embd, config.n_embd, tp, input_mode=mode, generator=generator
-        )
-        self.k = ColumnParallelLinear(
-            config.n_embd, config.n_embd, tp, input_mode=mode, generator=generator
-        )
-        self.v = ColumnParallelLinear(
-            config.n_embd, config.n_embd, tp, input_mode=mode, generator=generator
+        # Fused qkv: one matmul and ONE entry collective (f or g) per layer
+        # instead of three. The output rows are laid out head-major —
+        # [head0: q|k|v, head1: q|k|v, ...] — so the column split hands each
+        # rank contiguous whole heads, exactly like the unfused version.
+        self.qkv = ColumnParallelLinear(
+            config.n_embd, 3 * config.n_embd, tp, input_mode=mode, generator=generator
         )
         self.proj = RowParallelLinear(
             config.n_embd,
@@ -145,15 +149,16 @@ class CausalSelfAttention(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Under sequence parallelism x arrives sequence-sharded; the q/k/v
-        # projections all-gather it, so T comes from their output, not x.
+        # Under sequence parallelism x arrives sequence-sharded; the qkv
+        # projection all-gathers it, so T comes from its output, not x.
         B = x.shape[0]
         h, d = self.n_head_local, self.head_dim
-        q = self.q(x)
-        T = q.shape[1]
-        q = q.view(B, T, h, d).transpose(1, 2)
-        k = self.k(x).view(B, T, h, d).transpose(1, 2)
-        v = self.v(x).view(B, T, h, d).transpose(1, 2)
+        y = self.qkv(x)
+        T = y.shape[1]
+        y = y.view(B, T, h, 3, d)
+        q = y[:, :, :, 0].transpose(1, 2)
+        k = y[:, :, :, 1].transpose(1, 2)
+        v = y[:, :, :, 2].transpose(1, 2)
         if self.config.recompute_attention:
             y = recompute(core_attention, q, k, v)
         else:
@@ -212,10 +217,26 @@ def _make_head(config: GPTConfig, tp: TPContext, padded_vocab: int, seed: int):
         padded_vocab,
         tp,
         bias=False,
-        gather_output=True,
+        gather_output=not config.vocab_parallel_loss,
         input_mode="sequence" if config.sequence_parallel else "replicated",
         generator=_gen(seed, _COMP_HEAD),
     )
+
+
+def _head_loss(config: GPTConfig, tp: TPContext, head_out, targets):
+    """Shared logits/loss tail for GPT and GPTStage."""
+    if config.vocab_parallel_loss:
+        if targets is not None:
+            return None, vocab_parallel_cross_entropy(head_out, targets, tp, config.vocab_size)
+        logits = gather_from_tp_region(head_out, tp)[..., : config.vocab_size]
+        return logits, None
+    logits = head_out[..., : config.vocab_size]
+    loss = None
+    if targets is not None:
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1)
+        )
+    return logits, loss
 
 
 def _tag_sequence_parallel_replicated(module: nn.Module) -> None:
@@ -270,15 +291,7 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)
-        logits = self.lm_head(x)[..., : self.config.vocab_size]
-
-        loss = None
-        if targets is not None:
-            # Loss in fp32 regardless of model dtype (no-op when fp32).
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1)
-            )
-        return logits, loss
+        return _head_loss(self.config, self.tp, self.lm_head(x), targets)
 
 
 class GPTStage(nn.Module):
@@ -362,13 +375,7 @@ class GPTStage(nn.Module):
         if not self.is_last_stage:
             return x
         x = self.ln_f(x)
-        logits = self.lm_head(x)[..., : self.config.vocab_size]
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1)
-            )
-        return logits, loss
+        return _head_loss(self.config, self.tp, self.lm_head(x), targets)
 
 
 class GPTChunks(nn.Module):

@@ -172,8 +172,17 @@ def test_model(tp, model_tp, model_ref, cfg):
     idx, targets = make_batch(cfg, g)
 
     log(tp, "forward: TP logits vs reference, and across ranks")
-    logits_tp, loss_tp = model_tp(idx, targets)
-    logits_ref, loss_ref = model_ref(idx, targets)
+    if cfg.vocab_parallel_loss:
+        # With vocab-parallel loss the with-targets forward returns no
+        # logits; fetch them from a separate no-target forward.
+        with torch.no_grad():
+            logits_tp, _ = model_tp(idx)
+            logits_ref, _ = model_ref(idx)
+        _, loss_tp = model_tp(idx, targets)
+        _, loss_ref = model_ref(idx, targets)
+    else:
+        logits_tp, loss_tp = model_tp(idx, targets)
+        logits_ref, loss_ref = model_ref(idx, targets)
     ok &= check(tp, "logits", logits_tp, logits_ref)
     ok &= check(tp, "loss", loss_tp, loss_ref)
 
@@ -210,6 +219,7 @@ def test_training(tp, model_tp, model_ref, cfg, steps=10):
     for step in range(steps):
         _, loss_tp = model_tp(idx, targets)
         _, loss_ref = model_ref(idx, targets)
+        assert loss_tp is not None and loss_ref is not None
         worst = max(worst, abs(loss_tp.item() - loss_ref.item()))
         if step == 0:
             first = loss_tp.item()
@@ -252,6 +262,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sp", action="store_true", help="enable sequence parallelism")
     parser.add_argument("--recompute", action="store_true", help="selective recompute on the TP model")
+    parser.add_argument("--vp", action="store_true", help="vocab-parallel cross-entropy (both models)")
     parser.add_argument("--device", default=None, help="cuda|cpu (default: cuda if available)")
     args = parser.parse_args()
 
@@ -269,8 +280,9 @@ def main():
         n_embd=128,
         dropout=0.0,
         sequence_parallel=args.sp,
+        vocab_parallel_loss=args.vp,
     )
-    log(tp, f"tp={tp.world}, sp={args.sp}, recompute={args.recompute}, fp32, cpu, config={cfg}\n")
+    log(tp, f"tp={tp.world}, sp={args.sp}, recompute={args.recompute}, vp={args.vp}, config={cfg}\n")
 
     ok = test_conjugacy(tp)
     if args.sp:
