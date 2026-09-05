@@ -16,7 +16,7 @@ kernel would expand surface area without adding insight.
 - [x] **Tensor parallelism** with a numerical correctness suite
 - [x] **Sequence parallelism**
 - [x] **1F1B pipeline parallelism** (composes with TP and SP)
-- [ ] Interleaved pipeline schedule
+- [x] **Interleaved pipeline schedule**
 - [ ] Selective activation recompute
 - [ ] Data parallelism on top; benchmark against Megatron-LM
 
@@ -109,14 +109,41 @@ block, each embedding, the head) draws from its own generator seeded by
 bit-identical weights to the full model — same trick that makes TP init
 slice-exact, extended to the layer axis.
 
+## The interleaved schedule
+
+Instead of one contiguous block of layers, each rank holds `v`
+non-contiguous chunks: virtual stage `k = c·p + r` lives on rank `r` as
+chunk `c`, so a microbatch traverses the ranks `v` times and p2p becomes a
+ring — rank `p−1` wraps forward activations back to rank 0 at every chunk
+boundary. The bubble shrinks from `(p−1)/m` to `(p−1)/(m·v)`, paid for in
+`v` times as many, `v` times smaller point-to-point messages. The step
+order follows Megatron: `m·v` steps per direction, warmup of
+`2(p−1−r) + (v−1)p` forwards, chunk `(step mod pv) ÷ p` per forward step
+and the reverse for backward, with `m` divisible by `p`.
+
+Two implementation choices worth noting (`PipelineInterleaved`):
+
+- **Channels.** The ring wrap means one rank pair can carry several message
+  streams in the same direction — rank `p−1` sends rank 0 both forward-wrap
+  activations and backward grads, all identically shaped — so untagged FIFO
+  p2p matching could silently pair a recv with the wrong stream. NCCL has
+  no p2p tags; the portable equivalent is a separate process group per
+  (direction, chunk), used as a channel.
+- **Send discipline.** Sends are fire-and-forget isends, receives block.
+  That makes causal consistency of the step order sufficient for
+  deadlock-freedom, with no per-step combined-op flag machinery. The suite
+  asserts that in-flight activations per rank still stay bounded by the
+  warmup depth — the property that separates 1F1B from naive
+  all-forward-then-all-backward.
+
 ## Layout
 
 ```
 dst/parallel.py   process groups and topology (TPContext, PPContext)
 dst/ops.py        f/f̄ (TP), g/ḡ + scatter (SP), vocab gather — all collectives
 dst/layers.py     ColumnParallelLinear, RowParallelLinear
-dst/model.py      GPT-2 from scratch: GPT (whole model), GPTStage (one stage)
-dst/pipeline.py   1F1B schedule and p2p activation/gradient exchange
+dst/model.py      GPT-2 from scratch: GPT, GPTStage (one stage), GPTChunks (v chunks)
+dst/pipeline.py   1F1B and interleaved schedules, p2p activation/gradient exchange
 tests/            numerical correctness suites
 scripts/          launchers
 ```
@@ -145,6 +172,9 @@ equal the process count:
 scripts/launch_local.sh 2 tests/test_pp_correctness.py --pp 2 --micro 1
 scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 4 --micro 1
 scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 2 --tp 2 --micro 1 --sp
+scripts/launch_local.sh 2 tests/test_pp_correctness.py --pp 2 --chunks 2 --micro 1
+scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 4 --chunks 2 --layers 8 --micro 1
+scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 2 --tp 2 --chunks 2 --micro 1 --sp
 ```
 
 It checks the pipelined microbatched loss, every accumulated gradient, and

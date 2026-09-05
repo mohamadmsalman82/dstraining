@@ -30,8 +30,8 @@ import torch
 import torch.distributed as dist
 
 from dst import parallel
-from dst.model import GPT, GPTConfig, GPTStage
-from dst.pipeline import Pipeline1F1B
+from dst.model import GPT, GPTConfig, GPTStage, GPTChunks
+from dst.pipeline import Pipeline1F1B, PipelineInterleaved
 
 from test_tp_correctness import check, ref_slice, SEED, ATOL
 
@@ -47,21 +47,11 @@ def log_last(pp, tp, msg):
         print(msg, flush=True)
 
 
-def ref_name(stage, name):
-    """Map a stage-local param name to the full model's name."""
-    if name.startswith("blocks."):
-        parts = name.split(".")
-        per_stage = stage.config.n_layer // stage.pp.world
-        parts[1] = str(stage.pp.rank * per_stage + int(parts[1]))
-        return ".".join(parts)
-    return name
-
-
 def grads_match(stage, model_ref, tp):
     ref_params = dict(model_ref.named_parameters())
     worst_name, worst = None, -1.0
     for name, p in stage.named_parameters():
-        rp = ref_params[ref_name(stage, name)]
+        rp = ref_params[stage.ref_param_name(name)]
         grad_sl = ref_slice(stage, name, p, rp.grad, tp)
         d = (p.grad - grad_sl).abs().max().item()
         if d > worst:
@@ -75,6 +65,8 @@ def main():
     parser.add_argument("--pp", type=int, default=2)
     parser.add_argument("--micro", type=int, default=1, help="micro batch size")
     parser.add_argument("--sp", action="store_true")
+    parser.add_argument("--chunks", type=int, default=1, help="model chunks per rank (v>1: interleaved)")
+    parser.add_argument("--layers", type=int, default=4)
     args = parser.parse_args()
 
     parallel.init_distributed()
@@ -84,7 +76,7 @@ def main():
     cfg = GPTConfig(
         vocab_size=512,
         block_size=64,
-        n_layer=4,
+        n_layer=args.layers,
         n_head=8,
         n_embd=128,
         dropout=0.0,
@@ -92,12 +84,17 @@ def main():
     )
     B = 4
     n_micro = B // args.micro
-    log(f"tp={args.tp}, pp={args.pp}, sp={args.sp}, batch={B}, "
-        f"micro={args.micro} ({n_micro} microbatches), fp32, cpu\n")
+    log(f"tp={args.tp}, pp={args.pp}, sp={args.sp}, chunks={args.chunks}, "
+        f"layers={args.layers}, batch={B}, micro={args.micro} "
+        f"({n_micro} microbatches), fp32, cpu\n")
 
-    stage = GPTStage(cfg, tp, pp, seed=SEED)
     model_ref = GPT(cfg, parallel.SINGLE, seed=SEED)
-    pipe = Pipeline1F1B(stage, pp, micro_batch_size=args.micro, seq_len=cfg.block_size)
+    if args.chunks > 1:
+        stage = GPTChunks(cfg, tp, pp, v=args.chunks, seed=SEED)
+        pipe = PipelineInterleaved(stage, pp, micro_batch_size=args.micro, seq_len=cfg.block_size)
+    else:
+        stage = GPTStage(cfg, tp, pp, seed=SEED)
+        pipe = Pipeline1F1B(stage, pp, micro_batch_size=args.micro, seq_len=cfg.block_size)
 
     g = torch.Generator().manual_seed(SEED + 1)
     idx = torch.randint(0, cfg.vocab_size, (B, cfg.block_size), generator=g)
@@ -150,6 +147,16 @@ def main():
         fell = last < first
         ok &= fell
         log_last(pp, tp, f"  [{'PASS' if fell else 'FAIL'}] loss falls: {first:.4f} -> {last:.4f}")
+
+    if args.chunks > 1:
+        # In-flight (input, output) pairs must stay bounded by warmup depth,
+        # or the "schedule" is just naive all-forward-then-all-backward.
+        bound = min(2 * (args.pp - 1 - pp.rank) + (args.chunks - 1) * args.pp,
+                    n_micro * args.chunks) + 1
+        within = pipe.peak_in_flight <= bound
+        ok &= within
+        log(f"  [{'PASS' if within else 'FAIL'}] rank0 peak in-flight "
+            f"{pipe.peak_in_flight} <= warmup+1 = {bound}")
 
     verdict = torch.tensor(0 if ok else 1)
     dist.all_reduce(verdict)

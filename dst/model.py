@@ -265,28 +265,47 @@ class GPTStage(nn.Module):
     hidden state on non-last stages and (logits, loss) on the last. The
     1F1B schedule in dst/pipeline.py moves activations and their gradients
     between stages.
+
+    With the default arguments the stage is the contiguous slice implied by
+    pp. The interleaved schedule instead passes an explicit layer_range and
+    virtual-first/last flags to build one model chunk (see GPTChunks).
     """
 
-    def __init__(self, config: GPTConfig, tp: TPContext, pp: PPContext = PP_SINGLE, seed: int = 0):
+    def __init__(
+        self,
+        config: GPTConfig,
+        tp: TPContext,
+        pp: PPContext = PP_SINGLE,
+        seed: int = 0,
+        *,
+        layer_range=None,
+        is_first: bool = None,
+        is_last: bool = None,
+    ):
         super().__init__()
-        if config.n_layer % pp.world != 0:
-            raise ValueError(f"n_layer {config.n_layer} not divisible by pp {pp.world}")
         self.config = config
         self.tp = tp
         self.pp = pp
         self.padded_vocab = _pad_vocab(config.vocab_size)
 
-        per_stage = config.n_layer // pp.world
-        first_layer = pp.rank * per_stage
+        if layer_range is None:
+            if config.n_layer % pp.world != 0:
+                raise ValueError(f"n_layer {config.n_layer} not divisible by pp {pp.world}")
+            per_stage = config.n_layer // pp.world
+            layer_range = (pp.rank * per_stage, (pp.rank + 1) * per_stage)
+            is_first, is_last = pp.is_first, pp.is_last
+        self.first_layer = layer_range[0]
+        self.is_first_stage = is_first
+        self.is_last_stage = is_last
 
-        if pp.is_first:
+        if is_first:
             self.wte, self.wpe = _make_embeddings(config, seed)
             self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(
-            Block(config, tp, _gen(seed, _COMP_BLOCK0 + first_layer + i))
-            for i in range(per_stage)
+            Block(config, tp, _gen(seed, _COMP_BLOCK0 + self.first_layer + i))
+            for i in range(layer_range[1] - layer_range[0])
         )
-        if pp.is_last:
+        if is_last:
             self.ln_f = nn.LayerNorm(config.n_embd)
             self.lm_head = _make_head(config, tp, self.padded_vocab, seed)
         if config.sequence_parallel:
@@ -295,8 +314,16 @@ class GPTStage(nn.Module):
     def finalize_grads(self) -> None:
         _finalize_grads(self, self.config, self.tp)
 
+    def ref_param_name(self, name: str) -> str:
+        """Map a stage-local parameter name to the full GPT's name."""
+        if name.startswith("blocks."):
+            parts = name.split(".")
+            parts[1] = str(self.first_layer + int(parts[1]))
+            return ".".join(parts)
+        return name
+
     def forward(self, x: torch.Tensor, targets: torch.Tensor = None):
-        if self.pp.is_first:
+        if self.is_first_stage:
             B, T = x.shape
             pos = torch.arange(T, device=x.device)
             x = self.wte(x) + self.wpe(pos)
@@ -307,7 +334,7 @@ class GPTStage(nn.Module):
             x = self.drop(x)
         for block in self.blocks:
             x = block(x)
-        if not self.pp.is_last:
+        if not self.is_last_stage:
             return x
         x = self.ln_f(x)
         logits = self.lm_head(x)[..., : self.config.vocab_size]
@@ -315,3 +342,46 @@ class GPTStage(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
         return logits, loss
+
+
+class GPTChunks(nn.Module):
+    """The v model chunks one rank holds under the interleaved schedule.
+
+    Virtual stage k = c * p + r lives on rank r = k % p as chunk c = k // p,
+    so chunk c on rank r holds layers [(c*p + r) * L/(p*v), ...). A
+    microbatch runs rank 0..p-1 through chunk 0, wraps back to rank 0 for
+    chunk 1, and so on: p2p becomes a ring. Embeddings live in chunk 0 of
+    rank 0; head and loss in chunk v-1 of rank p-1.
+    """
+
+    def __init__(self, config: GPTConfig, tp: TPContext, pp: PPContext, v: int, seed: int = 0):
+        super().__init__()
+        p = pp.world
+        if config.n_layer % (p * v) != 0:
+            raise ValueError(f"n_layer {config.n_layer} not divisible by p*v {p * v}")
+        per = config.n_layer // (p * v)
+        self.config = config
+        self.tp = tp
+        self.pp = pp
+        self.v = v
+        self.chunks = nn.ModuleList()
+        for c in range(v):
+            first = (c * p + pp.rank) * per
+            self.chunks.append(
+                GPTStage(
+                    config,
+                    tp,
+                    pp,
+                    seed,
+                    layer_range=(first, first + per),
+                    is_first=(pp.rank == 0 and c == 0),
+                    is_last=(pp.rank == p - 1 and c == v - 1),
+                )
+            )
+
+    def finalize_grads(self) -> None:
+        _finalize_grads(self, self.config, self.tp)
+
+    def ref_param_name(self, name: str) -> str:
+        _, c, rest = name.split(".", 2)
+        return self.chunks[int(c)].ref_param_name(rest)
