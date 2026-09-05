@@ -1,357 +1,301 @@
+<div align="center">
+
 # dstraining
 
-A transformer training framework implementing tensor, sequence, pipeline, and
-data parallelism from scratch, benchmarked against Megatron-LM.
+**Tensor · Sequence · Pipeline · Data parallelism — written from scratch on raw collectives, benchmarked against Megatron-LM.**
 
-**What "from scratch" means here.** Every collective call and all of the
-parallelism logic is written in this repo. The allowed primitives are autograd,
-`torch.matmul`/cuBLAS, and raw NCCL/gloo collectives via `torch.distributed`.
-Not used: `DistributedDataParallel`, FSDP, `torch.distributed.pipelining`,
-DeepSpeed, Megatron, or any other parallelism library. No custom CUDA — nothing
-here needs a kernel; the matmuls are cuBLAS and the collectives are NCCL, and a
-kernel would expand surface area without adding insight.
+[![Python](https://img.shields.io/badge/python-3.12-blue)](#the-stack)
+[![PyTorch](https://img.shields.io/badge/pytorch-2.8%20%7C%202.12-ee4c2c)](#the-stack)
+[![backend](https://img.shields.io/badge/collectives-NCCL%20%2B%20gloo-76b900)](#the-stack)
+[![tests](https://img.shields.io/badge/correctness_suites-5%2F5_passing-brightgreen)](#correctness-as-a-first-class-feature)
+[![vs Megatron](https://img.shields.io/badge/vs_Megatron--LM-%2B37%25_pp4_·_%2B16%25_dp2-8a2be2)](#benchmarks-vs-megatron-lm)
 
-## Milestones
+*~3,500 lines. No DDP, no FSDP, no DeepSpeed, no `torch.distributed.pipelining`, no custom CUDA.*
 
-- [x] **Tensor parallelism** with a numerical correctness suite
-- [x] **Sequence parallelism**
-- [x] **1F1B pipeline parallelism** (composes with TP and SP)
-- [x] **Interleaved pipeline schedule**
-- [x] **Selective activation recompute**
-- [x] **Data parallelism on top** — full composition verified: dp2 × pp2 × tp2,
-      interleaved, with SP, on 8 processes
-- [x] **bf16 + fp32 master weights**, memmapped data, `train.py` composing
-      everything (loss falls on real tokens through the full stack)
-- [x] **GPU validation** — every suite passes under NCCL on real GPUs;
-      GPT-2 124M trains on FineWeb (loss 10.99 → 6.24) at 75k tok/s
-- [x] **Perf pass** — DP gradient bucketing + backward overlap, fused qkv,
-      vocab-parallel cross-entropy (dp scaling 1.64× → 1.81×, tp +75%)
-- [x] **Pipeline scaling at p=4; benchmarked against Megatron-LM**
-      (37% faster than Megatron pp4, 16% faster dp2, parity tp2 — details below)
+</div>
 
-## Measured results
+---
 
-All numbers 2026-09-05, torch 2.8.0+cu128, GPT-2-class models in bf16 with
-fp32 masters and selective recompute, steady-state tok/s (warmup excluded).
-Every correctness suite passes under torchrun + NCCL unchanged from the
-CPU/gloo versions — including the native `reduce_scatter_tensor` path gloo
-could only emulate — with gradient errors at the same ~1e-8 level.
-End-to-end: GPT-2 124M on a 30M-token FineWeb shard, loss 10.99 → 6.24 over
-600 steps (`docs/gpu-run-2x4090-fineweb.log`).
+Modern language models don't fit on one GPU, so training gets split across many.
+There are only a handful of ways to split — each cuts along a different axis, and
+each buys memory at the price of communication. This repo implements **all of
+them** from first principles, proves every one numerically correct against a
+single-process reference, composes them into one trainer, and races the result
+against NVIDIA's Megatron-LM on identical hardware and identical kernels:
 
-**2× RTX 4090 (PCIe, secure cloud), GPT-2 124M, micro-batch 8.** Megatron-LM
-run on the same box with `--transformer-impl local` (its TransformerEngine
-and fused CUDA kernels disabled), so both frameworks sit on identical stock
-PyTorch kernels and the comparison isolates the parallelism plumbing:
+<div align="center">
 
-| config | before perf pass | after | Megatron-LM |
-|---|---|---|---|
-| 1 GPU | 41.6k | 41.6k | — |
-| dp=2 | 68.1k (1.64×) | **75.4k (1.81×)** | 64.9k (with `--overlap-grad-reduce`) |
-| tp=2 | 23.7k | **41.3k** (with SP + vocab-parallel CE) | 43.6k (its torch path can't do SP) |
+| | pipeline (p=4) | data (d=2) | tensor (t=2) |
+|---|:---:|:---:|:---:|
+| **dstraining** | **51.6k tok/s** | **75.4k tok/s** | 41.3k tok/s |
+| Megatron-LM | 37.7k tok/s | 64.9k tok/s | 43.6k tok/s |
+| | **+37%** | **+16%** | −5% (see [benchmarks](#benchmarks-vs-megatron-lm)) |
 
-The tp=2 story: PCIe can't feed TP's per-layer all-reduces, which is the
-papers' claim that TP belongs inside NVLink, measured. The perf pass
-(fused qkv = one entry collective per attention instead of three;
-vocab-parallel CE = three scalar all-reduces instead of gathering
-`[b,s,50304]` logits) recovers parity with a single GPU; NVLink is what
-would turn it into a speedup.
+</div>
 
-**4× RTX 3090 (community cloud), 16-layer GPT-2ish, batch 32.** The bubble
-fraction `(p−1)/m` and its interleaved improvement, measured:
+> **What "from scratch" means here.** Every collective call and all of the
+> parallelism logic is written in this repo. The allowed primitives are
+> autograd, `torch.matmul`/cuBLAS, and raw NCCL/gloo collectives via
+> `torch.distributed`. Not used: `DistributedDataParallel`, FSDP,
+> `torch.distributed.pipelining`, DeepSpeed, Megatron, or any parallelism
+> library. No custom CUDA — the matmuls are cuBLAS and the collectives are
+> NCCL; a kernel would expand surface area without adding insight.
 
-| microbatches m | pp=4 1F1B | pp=4 interleaved (v=2) |
+## How a batch flows
+
+Eight ranks running everything at once — `rank = pp·(tp·dp) + dp·tp + tp_rank`,
+TP innermost so its bandwidth-hungry all-reduces stay node-local:
+
+```
+                     ┌────────────────  pipeline stage 0  ───────────────┐   ┌───── stage 1 ─────┐
+                     │  embed → blocks 0..7 (each: TP attn + TP MLP,     │   │  blocks 8..15     │
+   batch ── split ──▶│  activations sequence-sharded between them)       │──▶│  → ln_f → head    │──▶ loss
+        │            │                                                   │p2p│  vocab-parallel CE│
+        │            │   rank 0 ◀──f/f̄·g/ḡ──▶ rank 1     (TP pair)      │   │   rank 4 ◀─▶ 5    │
+        │            └───────────────────────────────────────────────────┘   └───────────────────┘
+        │            ┌───────────────────────────────────────────────────┐   ┌───────────────────┐
+        └── split ──▶│   rank 2 ◀────────────▶ rank 3     (DP replica 2) │──▶│   rank 6 ◀─▶ 7    │──▶ loss
+                     └───────────────────────────────────────────────────┘   └───────────────────┘
+                                  ▲ gradients all-reduced across DP replicas, bucketed,
+                                    overlapped with backward ▲
+```
+
+## What's implemented
+
+| axis | the mechanism | where |
 |---|---|---|
-| 4 | 42.8k | **46.0k** |
-| 8 | 49.1k | 49.1k |
-| 16 | **51.6k** | 49.3k |
-| 32 | 50.7k | 45.6k |
+| ✅ **Tensor parallelism** | column/row-split matmuls on the conjugate pair *f* (identity fwd / all-reduce bwd) and *f̄* (all-reduce fwd / identity bwd); attention split by heads, fused qkv | [`dst/ops.py`](dst/ops.py) · [`dst/layers.py`](dst/layers.py) |
+| ✅ **Sequence parallelism** | LayerNorm/dropout/residual regions sharded along seq via *g*/*ḡ* (all-gather ⇄ reduce-scatter); same bandwidth as TP's all-reduce, memory ÷ t for free | [`dst/ops.py`](dst/ops.py) |
+| ✅ **1F1B pipeline** | layer-split stages, cross-process autograd via stashed (input, output) pairs, deadlock-free combined `batch_isend_irecv` per step | [`dst/pipeline.py`](dst/pipeline.py) |
+| ✅ **Interleaved schedule** | v non-contiguous chunks per rank, ring p2p over per-(direction, chunk) communicator channels; bubble `(p−1)/m → (p−1)/(m·v)` | [`dst/pipeline.py`](dst/pipeline.py) |
+| ✅ **Data parallelism** | bucketed grad all-reduce, launched by post-accumulate-grad hooks so comm overlaps backward — DDP's core rebuilt on raw collectives | [`dst/dp.py`](dst/dp.py) |
+| ✅ **Selective recompute** | hand-materialized `s²·b·a` attention tensors discarded and rebuilt in backward by a 30-line custom autograd Function | [`dst/recompute.py`](dst/recompute.py) |
+| ✅ **Vocab-parallel CE** | loss straight from vocab shards via three `[N]`-scalar all-reduces; the `[b,s,50304]` logit tensor never exists | [`dst/loss.py`](dst/loss.py) |
+| ✅ **bf16 + fp32 masters** | updates applied in fp32, rounded once per step — the suite demonstrates plain-bf16 Adam stalling behind, live | [`dst/precision.py`](dst/precision.py) |
 
-Textbook shape: interleaving wins at small m (bubble halved: +7.5% at m=4),
-loses at large m where the bubble is already tiny and v× more p2p messages
-dominate. Single-GPU baseline for the same 16L model: 21.9k tok/s, so pp=4
-at m=16 reaches 2.36× (the rest is bubble + p2p + the batch-8-vs-32 gap in
-the baseline). **Megatron-LM on the same box, same 16L config, pp=4, m=16:
-37.7k tok/s — this framework's 1F1B is 37% faster.** Composed
-tp2 × pp2 + SP + vocab-parallel CE on the 4 GPUs: 26.5k tok/s at m=16.
+## Correctness as a first-class feature
 
-**Known limitation.** The interleaved schedule deadlocks under NCCL when
-composed with tp/dp > 1 (fine on gloo, fine on NCCL at tp=1, fully
-correctness-verified on CPU for every composition). Diagnosis: the
-schedule's channels are per-(direction, chunk) communicators, and NCCL
-requires ops on multiple communicators to be issued in a globally
-consistent order — with tp > 1 the tp-collective and channel-p2p orders
-diverge across ranks and unmatched p2p spin-kernels can starve the
-collectives. The fix is Megatron's approach: per-step combined
-`batch_isend_irecv` with the full warmup/steady flag machinery instead of
-fire-and-forget sends; documented here, not yet rebuilt. Use 1F1B when
-composing pipeline with TP on NCCL.
+The trick that makes everything testable: **initialization is invariant to the
+parallel decomposition**. Sharded layers draw the *full* weight from a seeded
+generator and keep their slice; every component seeds its own generator by
+`(base_seed, component_id)`. So a model split any way — tp×pp×dp, interleaved,
+sequence-parallel — holds *bit-identical* weights to a plain single-process
+model, and every rank can build that reference locally and compare **losses,
+every gradient shard, and multi-step Adam trajectories** with zero weight
+copying. All five suites pass identically on CPU/gloo and GPU/NCCL:
 
-Not measured for lack of budget/stock: TP over NVLink (needs an A100/H100
-pair) and p=8 pipelines (no 8×-NCCL-capable box in stock on the day; 8×
-MIG slices don't support NCCL — learned the hard way).
+```
+conjugacy of f/f̄ and g/ḡ ✓   shard-vs-slice init ✓   forward + cross-rank identity ✓
+every gradient vs reference ✓   Adam trajectory tracks reference ✓   loss falls ✓
+LayerNorm regions really [B, T/t, C] ✓   in-flight microbatches ≤ warmup depth ✓
+recompute drops exactly the predicted 2·s²·b·a bytes (saved_tensors_hooks) ✓
+```
 
-## How tensor parallelism works here
+The suites caught real bugs: SP's partial gradients on replicated params (a
+7e-2 error without the post-backward TP all-reduce), and an NCCL-only deadlock
+gloo could never see (below).
+
+## Benchmarks vs Megatron-LM
+
+Same box, same model, same batch — and Megatron run with
+`--transformer-impl local` (TransformerEngine and fused CUDA kernels off), so
+both frameworks sit on **identical stock PyTorch kernels** and the comparison
+isolates the parallelism plumbing. All numbers steady-state, warmup excluded.
+
+**2× RTX 4090 (PCIe) · GPT-2 124M · bf16 + masters · selective recompute:**
+
+| config | before perf pass | after perf pass | Megatron-LM |
+|---|:---:|:---:|:---:|
+| 1 GPU | 41.6k | 41.6k | — |
+| dp=2 | 68.1k (1.64×) | **75.4k (1.81×)** | 64.9k (`--overlap-grad-reduce` on) |
+| tp=2 | 23.7k | **41.3k** (+75%, with SP + vocab-parallel CE) | 43.6k (torch path can't do SP) |
+
+The tp=2 column is the papers' NVLink argument, measured: PCIe can't feed TP's
+per-layer all-reduces, so before the perf pass TP *lost* to a single GPU. Fused
+qkv (one entry collective per attention, not three) and vocab-parallel CE (no
+logit gather) recover parity; NVLink is what would turn it into a speedup.
+
+**4× RTX 3090 · 16-layer GPT-2ish · the pipeline bubble, measured:**
+
+```mermaid
+xychart-beta
+    title "pp=4 throughput vs microbatch count (tok/s)"
+    x-axis "microbatches m" [4, 8, 16, 32]
+    y-axis "steady-state tok/s" 40000 --> 53000
+    line "1F1B" [42820, 49125, 51633, 50739]
+    line "interleaved v=2" [46032, 49054, 49299, 45604]
+```
+
+Textbook shape: 1F1B climbs as the `(p−1)/m` bubble dies off; **interleaving
+wins exactly at small m** (+7.5% at m=4, its bubble is `(p−1)/(m·v)`) and loses
+at large m where the bubble is already tiny and v× more p2p messages dominate.
+Megatron-LM, same box, same config, pp=4, m=16: **37.7k vs our 51.6k (+37%)**.
+Composed tp2 × pp2 + SP + vocab-parallel CE: 26.5k tok/s.
+
+**End-to-end proof it trains:** GPT-2 124M on a 30M-token FineWeb shard, loss
+**10.99 → 6.24** over 600 steps at a sustained 75k tok/s
+([full log](docs/gpu-run-2x4090-fineweb.log)). Total cloud spend for the entire
+GPU phase — validation, training, perf work, benchmarks, across three boxes:
+**$2.12**.
+
+## The stack
+
+| layer | choice | why |
+|---|---|---|
+| language / framework | Python 3.12 · PyTorch 2.8 (GPU) / 2.12 (dev) | autograd + cuBLAS matmuls are the allowed primitives |
+| communication | raw `torch.distributed`: NCCL on GPU, gloo on CPU | identical code paths — all correctness work runs on a laptop |
+| launcher | `torchrun` (GPU) · [`scripts/launch_local.sh`](scripts/launch_local.sh) (CPU, FileStore rendezvous) | macOS DNS hangs torchrun's TCP rendezvous; FileStore needs no sockets |
+| model | GPT-2 architecture, written here (~300 lines) | small enough to verify, real enough to benchmark |
+| precision | bf16 activations/grads, fp32 master weights + Adam state | bf16 needs no loss scaling; updates underflow without masters |
+| data | memmapped uint16 token shards (FineWeb / OpenWebText via [`scripts/prepare_openwebtext.py`](scripts/prepare_openwebtext.py)), GPT-2 BPE via tiktoken | loss must fall to prove correctness; convergence isn't the point |
+| baseline | [Megatron-LM](https://github.com/NVIDIA/Megatron-LM), `--transformer-impl local` | same-kernel comparison isolates the parallelism |
+| infra | RunPod (2×4090, 4×3090), driven by `runpodctl` | rented by the hour; every result reproducible from the scripts |
+
+## Quickstart
+
+Everything below runs on a CPU-only laptop — that's the point of the gloo path.
+
+```bash
+git clone https://github.com/mohamadmsalman82/dstraining && cd dstraining
+pip install torch numpy
+
+# correctness suites (TP degree = process count; add --sp / --recompute / --vp)
+scripts/launch_local.sh 2 tests/test_tp_correctness.py --sp --recompute --vp
+scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 2 --tp 2 --chunks 2 --micro 1 --sp
+scripts/launch_local.sh 8 tests/test_dp_correctness.py --dp 2 --pp 2 --tp 2 --chunks 2 --micro 1 --sp --bucketed
+python3 tests/test_recompute.py
+scripts/launch_local.sh 2 tests/test_precision.py
+
+# train with every axis at once (on GPUs, use torchrun with the same flags)
+scripts/launch_local.sh 8 train.py --dp 2 --tp 2 --pp 2 --chunks 2 \
+    --sp --vp --recompute --bf16 --micro 2 --steps 40 --data synthetic
+```
+
+## How each axis works
+
+<details>
+<summary><b>Tensor parallelism — the conjugate operator pair</b></summary>
 
 The MLP computes `Z = GeLU(X·A)·B`. Split `A` by columns so each rank computes
 `GeLU(X·Aᵢ)` independently — GeLU is elementwise, a column split never mixes
-entries. Split `B` by rows so `Z = Y₁B₁ + Y₂B₂`, one all-reduce. Attention
-splits the same way, by heads: the q/k/v projections are column-parallel (a
-column split is exactly a head split), the output projection is row-parallel.
+entries. Split `B` by rows so `Z = Y₁B₁ + Y₂B₂`: one all-reduce. Attention
+splits the same way, by heads — the fused qkv projection is column-parallel
+with head-major rows (a column split hands each rank whole heads), the output
+projection row-parallel.
 
-Correctness comes from one pair of conjugate operators (`dst/ops.py`):
-
-| | forward | backward |
-|---|---|---|
-| `f` (copy_to_tp_region) | identity | all-reduce |
-| `f̄` (reduce_from_tp_region) | all-reduce | identity |
-
-A column-parallel linear applies `f` to its input, a row-parallel linear
-applies `f̄` to its output, and every gradient — including those of replicated
-parameters like LayerNorms and embeddings, which need no extra sync — comes out
-right with no other bookkeeping. The correctness suite asserts this.
-
-Initialization is invariant to the parallel degree: each sharded layer draws
-the full weight matrix from a shared seeded generator and keeps its slice, so a
-tp=4 model holds exact slices of the tp=1 model's weights. That is what lets
-the suite compare a TP model against a plain single-process reference with no
-weight copying, and it is why the training loss trajectory is identical
-(within fp32 noise) at tp=1, 2, and 4.
-
-## How sequence parallelism works here
-
-LayerNorm and dropout can't split along the hidden dimension, so under plain
-TP every rank redundantly holds the full `b·s·h` activation in those regions.
-Sequence parallelism (`GPTConfig.sequence_parallel`) shards them along the
-sequence axis instead, swapping the conjugate pair:
+Correctness comes from one pair of conjugate operators:
 
 | | forward | backward |
 |---|---|---|
-| `g` (gather_along_seq) | all-gather over seq | reduce-scatter over seq |
-| `ḡ` (reduce_scatter_along_seq) | reduce-scatter over seq | all-gather over seq |
+| `f` | identity | all-reduce |
+| `f̄` | all-reduce | identity |
 
-Since an all-reduce *is* a reduce-scatter followed by an all-gather, total
-bandwidth is unchanged — the memory is free. Column-parallel layers enter via
-`g`, row-parallel layers exit via `ḡ`, the embedding output is scattered along
-seq, and inside the TP region the sequence stays full (attention needs every
-key). The suite verifies with forward hooks that every LayerNorm really sees
-`[B, T/tp, C]`.
+Column-parallel layers apply `f` on the way in, row-parallel layers apply `f̄`
+on the way out, and every gradient — including replicated params like
+LayerNorms, which need no extra sync — comes out right with no other
+bookkeeping. Communication per all-reduce scales as `b·s·h`: bandwidth-hungry,
+belongs inside one node.
+</details>
 
-The one cost the conjugate operators don't cover: replicated params that
-consume sequence-sharded activations (LayerNorm weights/biases, row-parallel
-biases added after the reduce-scatter) get partial gradients — each rank only
-sees its sequence chunk. `GPT.finalize_grads()` all-reduces exactly those
-grads across the TP group after backward; the suite's gradient checks fail
-without it. (Embedding grads are unaffected: the scatter's backward
-all-gathers, restoring full gradients.)
+<details>
+<summary><b>Sequence parallelism — the memory leak TP leaves behind</b></summary>
 
-gloo has no native reduce-scatter, so the CPU path emulates it with
-all-reduce + slice (same result, an all-gather's worth of extra bandwidth);
-NCCL uses the real `reduce_scatter_tensor`.
+LayerNorm and dropout can't split along the hidden dimension, so under plain TP
+every rank redundantly holds the full `b·s·h` activation there. SP shards those
+regions along the sequence axis instead, swapping the pair for `g` (all-gather
+seq fwd / reduce-scatter bwd) and `ḡ` (its conjugate). Since an all-reduce *is*
+a reduce-scatter + an all-gather, total bandwidth is unchanged — the memory is
+free: every per-layer activation term divides by t.
 
-## How pipeline parallelism works here
+The one cost the conjugates don't cover: replicated params consuming
+seq-sharded activations (LayerNorm weights, post-reduce-scatter biases) get
+*partial* gradients — each rank only sees its chunk. `finalize_grads()`
+all-reduces exactly those across the TP group; the suite fails 7e-2 without it.
+</details>
 
-The model splits by layer into `GPTStage`s: embeddings on the first stage,
-`ln_f` + LM head + loss on the last, a contiguous slice of blocks on each.
-Ranks lay out as `rank = pp_rank · tp_size + tp_rank`, so a TP group is
-consecutive ranks (one node over NVLink on real hardware) and a pipeline
-neighbor is the corresponding TP rank `tp_size` away.
+<details>
+<summary><b>Pipeline parallelism — 1F1B and the interleaved schedule</b></summary>
 
-The schedule (`dst/pipeline.py`) is 1F1B: after a warmup of `p − 1 − stage`
-forwards, each stage alternates one-forward-one-backward, capping in-flight
-activations at `p − stage` microbatches regardless of `m`. The bubble
-fraction is `(p−1)/m`; interleaving (next milestone) improves it to
-`(p−1)/(m·v)`.
+The model splits by layer into stages; autograd doesn't span processes, so each
+stage stashes (input, output) pairs per in-flight microbatch, receives
+`∂loss/∂output` from downstream, runs autograd locally, ships `∂loss/∂input`
+upstream. 1F1B caps in-flight microbatches at `p − stage` regardless of m; each
+step's sends and receives post as one `batch_isend_irecv`, which is what makes
+the steady state deadlock-free. Bubble fraction: `(p−1)/m`.
 
-Autograd doesn't span processes, so each stage stashes `(input, output)`
-pairs for its in-flight microbatches; backward receives `∂loss/∂output` from
-downstream, runs autograd over the local segment, and ships `∂loss/∂input`
-upstream. Per-microbatch losses are scaled by `1/m`, so the accumulated
-gradients equal the full-batch gradient — the suite checks them to ~1e-8.
-Each schedule step's sends and receives are posted as one
-`batch_isend_irecv`, which is what keeps the steady state deadlock-free
-(a blocking send can't wait on a recv that hasn't been posted). Activation
-shapes are static per config, so there's no shape handshake; under SP the
-boundary tensors are sequence-sharded, so p2p volume divides by `tp` too.
+Interleaving gives each rank v non-contiguous chunks — virtual stage
+`k = c·p + r` on rank `k mod p` — so p2p becomes a ring and the bubble shrinks
+to `(p−1)/(m·v)`, paid in v× more, v× smaller messages. The ring wrap puts
+multiple identically-shaped streams on one rank pair and NCCL has no p2p tags,
+so each (direction, chunk) gets its own process group as a channel.
 
-Init is invariant to the pipeline split as well: every component (each
-block, each embedding, the head) draws from its own generator seeded by
-`(base seed, component id)`, so a stage that builds only its layers gets
-bit-identical weights to the full model — same trick that makes TP init
-slice-exact, extended to the layer axis.
+Init is pp-invariant too: per-component seeded generators mean any stage draws
+bit-identical weights to the full model.
+</details>
 
-## The interleaved schedule
+<details>
+<summary><b>Selective recompute — measured with saved_tensors_hooks</b></summary>
 
-Instead of one contiguous block of layers, each rank holds `v`
-non-contiguous chunks: virtual stage `k = c·p + r` lives on rank `r` as
-chunk `c`, so a microbatch traverses the ranks `v` times and p2p becomes a
-ring — rank `p−1` wraps forward activations back to rank 0 at every chunk
-boundary. The bubble shrinks from `(p−1)/m` to `(p−1)/(m·v)`, paid for in
-`v` times as many, `v` times smaller point-to-point messages. The step
-order follows Megatron: `m·v` steps per direction, warmup of
-`2(p−1−r) + (v−1)p` forwards, chunk `(step mod pv) ÷ p` per forward step
-and the reverse for backward, with `m` divisible by `p`.
+Core attention (`softmax(QKᵀ/√d)·V`) is written by hand and materializes the
+`s×s` attention matrix the way pre-FlashAttention kernels do — deliberately,
+because those `s²·b·a` tensors are what selective recompute exists to discard
+(SDPA would never allocate them and there'd be nothing to measure).
+`recompute()` is a custom autograd Function: no-grad forward saving only q/k/v,
+re-run in backward. The test measures what autograd actually stashes:
+4,210,688 bytes dropped vs 4,194,304 predicted by the `2·s²·b·a` term,
+gradients bitwise identical.
+</details>
 
-Two implementation choices worth noting (`PipelineInterleaved`):
+<details>
+<summary><b>Data parallelism — DDP's core on raw collectives</b></summary>
 
-- **Channels.** The ring wrap means one rank pair can carry several message
-  streams in the same direction — rank `p−1` sends rank 0 both forward-wrap
-  activations and backward grads, all identically shaped — so untagged FIFO
-  p2p matching could silently pair a recv with the wrong stream. NCCL has
-  no p2p tags; the portable equivalent is a separate process group per
-  (direction, chunk), used as a channel.
-- **Send discipline.** Sends are fire-and-forget isends, receives block.
-  That makes causal consistency of the step order sufficient for
-  deadlock-freedom, with no per-step combined-op flag machinery. The suite
-  asserts that in-flight activations per rank still stay bounded by the
-  warmup depth — the property that separates 1F1B from naive
-  all-forward-then-all-backward.
+Grads group into ~25MB buckets in reverse parameter order (the order backward
+produces them); each bucket flattens and all-reduces asynchronously the moment
+its last gradient lands, via post-accumulate-grad hooks — communication
+overlaps the rest of backward. Pipeline schedules accumulate over microbatches,
+so they use the non-overlapped variant (buckets still pipeline against each
+other). Measured worth: 1.64× → 1.81× on 2 GPUs.
+</details>
 
-## Data parallelism
+<details>
+<summary><b>Vocab-parallel cross-entropy — the logit gather you never do</b></summary>
 
-The last axis is the simple one: each DP replica holds a full copy of its
-(tp, pp)-sharded model, takes its own slice of the global batch, and after
-backward every gradient is all-reduced and averaged across the DP group
-(`dst/dp.py`). Ranks lay out as `rank = pp·(tp·dp) + dp·tp + tp_rank`, so
-TP stays innermost and node-local, DP groups stride by `tp` within a
-stage, and pipeline neighbors stride by `tp·dp`. What DDP adds beyond this
-is performance engineering — grad bucketing and overlapping the
-all-reduce with backward — which lands with the GPU phase.
+With a column-parallel LM head, gathering logits materializes `[b, s, 50304]`
+per rank — the largest activation in the model. Instead: local max +
+all-reduce(MAX), local Σexp + all-reduce(SUM), and the target logit (each id
+lives on exactly one rank) + all-reduce(SUM). Three `[N]`-scalar all-reduces
+replace the gather; backward is local softmax-minus-onehot on this rank's
+columns. Padded vocab columns mask to −inf and get zero gradient.
+</details>
 
-The DP suite checks the composition of everything at once: the flagship
-config is `dp2 × pp2 × tp2` with interleaving and sequence parallelism on
-8 processes, where DP-averaged losses, every gradient, and a 5-step Adam
-trajectory match the full-batch single-process reference.
+## Known limitation (found the honest way)
 
-## Selective recompute
+The interleaved schedule **deadlocks under NCCL when composed with tp/dp > 1**
+— fine on gloo, fine on NCCL at tp=1, fully correctness-verified on CPU for
+every composition. Diagnosis: the channels are multiple communicators, NCCL
+requires ops across communicators in a globally consistent order, and with
+tp > 1 the tp-collective and channel-p2p orders diverge across ranks while
+unmatched p2p spin-kernels can starve the collectives. The fix is Megatron's
+approach — per-step combined batched p2p with the full warmup/steady flag
+machinery instead of fire-and-forget sends. Documented, not yet rebuilt: use
+1F1B when composing pipeline with TP on NCCL.
 
-Core attention — `softmax(QKᵀ/√d)·V` — is written by hand and materializes
-the `s×s` attention matrix the way pre-FlashAttention kernels do. That is
-deliberate: those tensors are the `s²·b·a`-scaling activations selective
-recompute exists to discard, so the framework must actually allocate them
-(SDPA would silently never create them and there'd be nothing to measure).
-
-`recompute()` (`dst/recompute.py`) is a 30-line custom autograd Function,
-not `torch.utils.checkpoint`: forward runs the region under `no_grad`
-saving only q/k/v (alive in the surrounding graph anyway), backward
-re-runs it and backpropagates through the fresh subgraph. Requires the
-region to be deterministic and RNG-free, which core attention here is.
-
-The test measures what autograd actually stashes via
-`saved_tensors_hooks`: with `recompute_attention` on, saved-for-backward
-bytes drop by the analytic `2·s²·b·a` attention-matrix term (4,210,688
-observed vs 4,194,304 predicted for the test config), gradients are
-bitwise identical, and the region runs exactly twice per layer per
-microbatch. The TP suite's `--recompute` flag puts recompute on the
-parallel model only, so every comparison against the full-activation
-reference cross-validates it under TP and SP too.
-
-## Mixed precision and training
-
-`MasterWeightOptimizer` (`dst/precision.py`): bf16 params/activations/
-grads, fp32 master weights and Adam state. A weight update of `lr·grad`
-~1e-4 of the weight underflows bf16's 8 mantissa bits — applied in fp32
-and rounded once per step, the signal accumulates. bf16 needs no loss
-scaling (that's fp16's narrow-exponent problem). The test suite
-demonstrates the failure mode live: the same model with plain-bf16 Adam
-lands measurably behind, while bf16+masters tracks the fp32 trajectory to
-a ~0.006 final-loss gap.
-
-`train.py` composes every axis behind flags; data is a memmapped uint16
-token shard (`scripts/prepare_openwebtext.py`, nanoGPT convention) or
-`--data synthetic`. Batches are drawn at offsets seeded by
-`(seed, step, dp_rank)`: every rank of one DP replica computes the
-identical batch with zero communication (first stage needs the tokens,
-last stage the targets), while DP replicas draw independent data.
-
-```
-scripts/launch_local.sh 8 train.py --dp 2 --pp 2 --tp 2 --chunks 2 \
-    --sp --recompute --bf16 --micro 2 --steps 40 --data <shard.bin>
-```
-
-runs everything at once; on GPUs, launch the same file with torchrun.
+Also learned at $4.72/hr: 8× MIG slices don't speak NCCL.
 
 ## Layout
 
 ```
-dst/parallel.py   process groups and topology (TPContext, PPContext)
-dst/ops.py        f/f̄ (TP), g/ḡ + scatter (SP), vocab gather — all collectives
-dst/layers.py     ColumnParallelLinear, RowParallelLinear
-dst/model.py      GPT-2 from scratch: GPT, GPTStage (one stage), GPTChunks (v chunks)
-dst/pipeline.py   1F1B and interleaved schedules, p2p activation/gradient exchange
-dst/recompute.py  selective activation recompute (custom autograd Function)
-dst/dp.py         data-parallel gradient all-reduce
-dst/precision.py  bf16 + fp32 master weights
-dst/data.py       memmapped token shard, deterministic batch draws
-train.py          training entrypoint composing every axis
-tests/            numerical correctness suites
-scripts/          launchers, data prep
+dst/parallel.py    process groups and topology: TPContext, PPContext, DP groups
+dst/ops.py         f/f̄ (TP), g/ḡ + scatter (SP), vocab gather — all collectives
+dst/layers.py      ColumnParallelLinear, RowParallelLinear (init tp-invariant)
+dst/model.py       GPT-2 from scratch: GPT, GPTStage, GPTChunks
+dst/pipeline.py    1F1B and interleaved schedules, p2p exchange
+dst/dp.py          bucketed + overlapped data-parallel grad reduction
+dst/recompute.py   selective activation recompute (custom autograd Function)
+dst/loss.py        vocab-parallel cross-entropy
+dst/precision.py   bf16 + fp32 master weights
+dst/data.py        memmapped token shards, deterministic batch draws
+train.py           the trainer: every axis behind a flag
+tests/             the five correctness suites
+scripts/           launchers, data prep
 ```
-
-## Running the correctness suite
-
-On a CUDA machine:
-
-```
-torchrun --standalone --nproc_per_node=2 tests/test_tp_correctness.py
-```
-
-On a CPU-only machine (including macOS, where torchrun's TCP rendezvous can
-hang on DNS — the local launcher uses a FileStore instead):
-
-```
-scripts/launch_local.sh 2 tests/test_tp_correctness.py
-```
-
-Add `--sp` to run the same suite with sequence parallelism enabled, and
-`--recompute` to enable selective recompute on the parallel model only.
-The recompute memory/equivalence test is single-process:
-`python3 tests/test_recompute.py`.
-
-The pipeline suite composes all three axes; TP degree × PP degree must
-equal the process count:
-
-```
-scripts/launch_local.sh 2 tests/test_pp_correctness.py --pp 2 --micro 1
-scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 4 --micro 1
-scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 2 --tp 2 --micro 1 --sp
-scripts/launch_local.sh 2 tests/test_pp_correctness.py --pp 2 --chunks 2 --micro 1
-scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 4 --chunks 2 --layers 8 --micro 1
-scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 2 --tp 2 --chunks 2 --micro 1 --sp
-```
-
-It checks the pipelined microbatched loss, every accumulated gradient, and
-a 5-step Adam trajectory against the full-batch single-process reference.
-
-The DP suite composes all four axes:
-
-```
-scripts/launch_local.sh 2 tests/test_dp_correctness.py --dp 2
-scripts/launch_local.sh 4 tests/test_dp_correctness.py --dp 2 --tp 2 --sp
-scripts/launch_local.sh 4 tests/test_dp_correctness.py --dp 2 --pp 2 --micro 1
-scripts/launch_local.sh 8 tests/test_dp_correctness.py --dp 2 --pp 2 --tp 2 --chunks 2 --micro 1 --sp
-```
-
-For the TP suite, TP degree = number of processes. The suite checks, in fp32:
-conjugacy of `f`/`f̄` (and `g`/`ḡ` under `--sp`) on a toy split,
-shard-vs-slice init identity, sequence sharding of LayerNorm regions,
-forward logits vs the reference and across ranks, every gradient shard vs
-the sliced reference gradient, and a 10-step Adam trajectory that must
-track the reference and fall.
-
-## Notes and deliberate scope cuts (so far)
-
-- q/k/v are three separate column-parallel linears rather than one fused
-  projection; fusing needs Megatron's interleaved per-head weight layout and
-  buys only matmul batching. Revisit when profiling.
-- The LM head is column-parallel over a vocab padded to a multiple of 128
-  (fixed, so init stays tp-invariant) with logits gathered before the loss.
-  Vocab-parallel cross-entropy — which avoids materializing full logits —
-  comes later.
-- No embedding/LM-head weight tying: the head holds a vocab shard while the
-  embedding is replicated.
-- Dropout defaults to 0. Replicated regions need shared RNG state across TP
-  ranks and parallel regions need per-rank state; under SP the dropout
-  regions are sequence-sharded (disjoint chunks), which makes per-rank RNG
-  correct there — but the shared-state discipline for the plain-TP path is
-  still unimplemented, so keep dropout at 0 for now.
