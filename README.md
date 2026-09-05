@@ -12,6 +12,8 @@
 
 *~3,500 lines. No DDP, no FSDP, no DeepSpeed, no `torch.distributed.pipelining`, no custom CUDA.*
 
+**[Read the full write-up →](docs/WRITEUP.md)** — the complete build narrative, every bug, every number, and the $2.12 GPU bill.
+
 </div>
 
 ---
