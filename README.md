@@ -22,33 +22,74 @@ kernel would expand surface area without adding insight.
       interleaved, with SP, on 8 processes
 - [x] **bf16 + fp32 master weights**, memmapped data, `train.py` composing
       everything (loss falls on real tokens through the full stack)
-- [x] **GPU validation** — every suite passes under NCCL on 2× RTX 4090;
-      GPT-2 124M trains on FineWeb at 69.7k tok/s (see below)
-- [ ] Perf pass: DP gradient bucketing + backward overlap, fused qkv,
-      vocab-parallel cross-entropy
-- [ ] Pipeline scaling numbers at p=4/8; benchmark against Megatron-LM
+- [x] **GPU validation** — every suite passes under NCCL on real GPUs;
+      GPT-2 124M trains on FineWeb (loss 10.99 → 6.24) at 75k tok/s
+- [x] **Perf pass** — DP gradient bucketing + backward overlap, fused qkv,
+      vocab-parallel cross-entropy (dp scaling 1.64× → 1.81×, tp +75%)
+- [x] **Pipeline scaling at p=4; benchmarked against Megatron-LM**
+      (37% faster than Megatron pp4, 16% faster dp2, parity tp2 — details below)
 
-## GPU validation (2× RTX 4090, PCIe, secure cloud)
+## Measured results
 
-2026-09-05, torch 2.8.0+cu128. All five correctness suites pass under
-torchrun + NCCL unchanged — including the native `reduce_scatter_tensor`
-path the CPU/gloo suites could only emulate, bf16 collectives, and GPU
-p2p for both pipeline schedules. Gradient errors sit at the same ~1e-8
-level as on CPU.
+All numbers 2026-09-05, torch 2.8.0+cu128, GPT-2-class models in bf16 with
+fp32 masters and selective recompute, steady-state tok/s (warmup excluded).
+Every correctness suite passes under torchrun + NCCL unchanged from the
+CPU/gloo versions — including the native `reduce_scatter_tensor` path gloo
+could only emulate — with gradient errors at the same ~1e-8 level.
+End-to-end: GPT-2 124M on a 30M-token FineWeb shard, loss 10.99 → 6.24 over
+600 steps (`docs/gpu-run-2x4090-fineweb.log`).
 
-Training GPT-2 124M (bf16 + fp32 masters, selective recompute) on a 30M-token
-FineWeb shard, 600 steps (`docs/gpu-run-2x4090-fineweb.log`):
+**2× RTX 4090 (PCIe, secure cloud), GPT-2 124M, micro-batch 8.** Megatron-LM
+run on the same box with `--transformer-impl local` (its TransformerEngine
+and fused CUDA kernels disabled), so both frameworks sit on identical stock
+PyTorch kernels and the comparison isolates the parallelism plumbing:
 
-| config | tok/s | note |
+| config | before perf pass | after | Megatron-LM |
+|---|---|---|---|
+| 1 GPU | 41.6k | 41.6k | — |
+| dp=2 | 68.1k (1.64×) | **75.4k (1.81×)** | 64.9k (with `--overlap-grad-reduce`) |
+| tp=2 | 23.7k | **41.3k** (with SP + vocab-parallel CE) | 43.6k (its torch path can't do SP) |
+
+The tp=2 story: PCIe can't feed TP's per-layer all-reduces, which is the
+papers' claim that TP belongs inside NVLink, measured. The perf pass
+(fused qkv = one entry collective per attention instead of three;
+vocab-parallel CE = three scalar all-reduces instead of gathering
+`[b,s,50304]` logits) recovers parity with a single GPU; NVLink is what
+would turn it into a speedup.
+
+**4× RTX 3090 (community cloud), 16-layer GPT-2ish, batch 32.** The bubble
+fraction `(p−1)/m` and its interleaved improvement, measured:
+
+| microbatches m | pp=4 1F1B | pp=4 interleaved (v=2) |
 |---|---|---|
-| 1 GPU | 42.4k | baseline |
-| dp=2 | 69.7k | 1.64× — gap to 2× is the unbucketed per-param grad all-reduce |
-| tp=2 + sp | 23.7k | slower than 1 GPU: PCIe can't feed TP's per-layer all-reduces |
+| 4 | 42.8k | **46.0k** |
+| 8 | 49.1k | 49.1k |
+| 16 | **51.6k** | 49.3k |
+| 32 | 50.7k | 45.6k |
 
-Loss 10.99 → 6.24 over 600 steps. The tp=2 number is the papers' claim
-that TP belongs inside NVLink, measured; the dp=2 gap is the motivation
-for bucketing + overlap. Both are the next milestone's before/after
-baselines.
+Textbook shape: interleaving wins at small m (bubble halved: +7.5% at m=4),
+loses at large m where the bubble is already tiny and v× more p2p messages
+dominate. Single-GPU baseline for the same 16L model: 21.9k tok/s, so pp=4
+at m=16 reaches 2.36× (the rest is bubble + p2p + the batch-8-vs-32 gap in
+the baseline). **Megatron-LM on the same box, same 16L config, pp=4, m=16:
+37.7k tok/s — this framework's 1F1B is 37% faster.** Composed
+tp2 × pp2 + SP + vocab-parallel CE on the 4 GPUs: 26.5k tok/s at m=16.
+
+**Known limitation.** The interleaved schedule deadlocks under NCCL when
+composed with tp/dp > 1 (fine on gloo, fine on NCCL at tp=1, fully
+correctness-verified on CPU for every composition). Diagnosis: the
+schedule's channels are per-(direction, chunk) communicators, and NCCL
+requires ops on multiple communicators to be issued in a globally
+consistent order — with tp > 1 the tp-collective and channel-p2p orders
+diverge across ranks and unmatched p2p spin-kernels can starve the
+collectives. The fix is Megatron's approach: per-step combined
+`batch_isend_irecv` with the full warmup/steady flag machinery instead of
+fire-and-forget sends; documented here, not yet rebuilt. Use 1F1B when
+composing pipeline with TP on NCCL.
+
+Not measured for lack of budget/stock: TP over NVLink (needs an A100/H100
+pair) and p=8 pipelines (no 8×-NCCL-capable box in stock on the day; 8×
+MIG slices don't support NCCL — learned the hard way).
 
 ## How tensor parallelism works here
 
