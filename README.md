@@ -22,7 +22,33 @@ kernel would expand surface area without adding insight.
       interleaved, with SP, on 8 processes
 - [x] **bf16 + fp32 master weights**, memmapped data, `train.py` composing
       everything (loss falls on real tokens through the full stack)
-- [ ] Benchmark against Megatron-LM (needs GPUs)
+- [x] **GPU validation** — every suite passes under NCCL on 2× RTX 4090;
+      GPT-2 124M trains on FineWeb at 69.7k tok/s (see below)
+- [ ] Perf pass: DP gradient bucketing + backward overlap, fused qkv,
+      vocab-parallel cross-entropy
+- [ ] Pipeline scaling numbers at p=4/8; benchmark against Megatron-LM
+
+## GPU validation (2× RTX 4090, PCIe, secure cloud)
+
+2026-09-05, torch 2.8.0+cu128. All five correctness suites pass under
+torchrun + NCCL unchanged — including the native `reduce_scatter_tensor`
+path the CPU/gloo suites could only emulate, bf16 collectives, and GPU
+p2p for both pipeline schedules. Gradient errors sit at the same ~1e-8
+level as on CPU.
+
+Training GPT-2 124M (bf16 + fp32 masters, selective recompute) on a 30M-token
+FineWeb shard, 600 steps (`docs/gpu-run-2x4090-fineweb.log`):
+
+| config | tok/s | note |
+|---|---|---|
+| 1 GPU | 42.4k | baseline |
+| dp=2 | 69.7k | 1.64× — gap to 2× is the unbucketed per-param grad all-reduce |
+| tp=2 + sp | 23.7k | slower than 1 GPU: PCIe can't feed TP's per-layer all-reduces |
+
+Loss 10.99 → 6.24 over 600 steps. The tp=2 number is the papers' claim
+that TP belongs inside NVLink, measured; the dp=2 gap is the motivation
+for bucketing + overlap. Both are the next milestone's before/after
+baselines.
 
 ## How tensor parallelism works here
 
