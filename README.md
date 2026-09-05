@@ -20,7 +20,8 @@ kernel would expand surface area without adding insight.
 - [x] **Selective activation recompute**
 - [x] **Data parallelism on top** — full composition verified: dp2 × pp2 × tp2,
       interleaved, with SP, on 8 processes
-- [ ] bf16 + fp32 master weights, real data, training run
+- [x] **bf16 + fp32 master weights**, memmapped data, `train.py` composing
+      everything (loss falls on real tokens through the full stack)
 - [ ] Benchmark against Megatron-LM (needs GPUs)
 
 ## How tensor parallelism works here
@@ -178,6 +179,31 @@ microbatch. The TP suite's `--recompute` flag puts recompute on the
 parallel model only, so every comparison against the full-activation
 reference cross-validates it under TP and SP too.
 
+## Mixed precision and training
+
+`MasterWeightOptimizer` (`dst/precision.py`): bf16 params/activations/
+grads, fp32 master weights and Adam state. A weight update of `lr·grad`
+~1e-4 of the weight underflows bf16's 8 mantissa bits — applied in fp32
+and rounded once per step, the signal accumulates. bf16 needs no loss
+scaling (that's fp16's narrow-exponent problem). The test suite
+demonstrates the failure mode live: the same model with plain-bf16 Adam
+lands measurably behind, while bf16+masters tracks the fp32 trajectory to
+a ~0.006 final-loss gap.
+
+`train.py` composes every axis behind flags; data is a memmapped uint16
+token shard (`scripts/prepare_openwebtext.py`, nanoGPT convention) or
+`--data synthetic`. Batches are drawn at offsets seeded by
+`(seed, step, dp_rank)`: every rank of one DP replica computes the
+identical batch with zero communication (first stage needs the tokens,
+last stage the targets), while DP replicas draw independent data.
+
+```
+scripts/launch_local.sh 8 train.py --dp 2 --pp 2 --tp 2 --chunks 2 \
+    --sp --recompute --bf16 --micro 2 --steps 40 --data <shard.bin>
+```
+
+runs everything at once; on GPUs, launch the same file with torchrun.
+
 ## Layout
 
 ```
@@ -188,8 +214,11 @@ dst/model.py      GPT-2 from scratch: GPT, GPTStage (one stage), GPTChunks (v ch
 dst/pipeline.py   1F1B and interleaved schedules, p2p activation/gradient exchange
 dst/recompute.py  selective activation recompute (custom autograd Function)
 dst/dp.py         data-parallel gradient all-reduce
+dst/precision.py  bf16 + fp32 master weights
+dst/data.py       memmapped token shard, deterministic batch draws
+train.py          training entrypoint composing every axis
 tests/            numerical correctness suites
-scripts/          launchers
+scripts/          launchers, data prep
 ```
 
 ## Running the correctness suite

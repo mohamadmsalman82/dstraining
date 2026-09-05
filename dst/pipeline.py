@@ -57,20 +57,23 @@ class Pipeline1F1B:
         seq_local = seq_len // stage.tp.world if cfg.sequence_parallel else seq_len
         self.act_shape = (micro_batch_size, seq_local, cfg.n_embd)
         self.micro_batch_size = micro_batch_size
+        # p2p buffers must match the activation dtype (bf16 under mixed
+        # precision); the params' dtype is the activations' dtype here.
+        self.act_dtype = next(stage.parameters()).dtype
 
     # -- p2p helpers ------------------------------------------------------
 
     def _recv_forward(self) -> Optional[torch.Tensor]:
         if self.pp.is_first:
             return None
-        x = torch.empty(self.act_shape)
+        x = torch.empty(self.act_shape, dtype=self.act_dtype)
         _exchange([(x, self.pp.prev_rank)], [])
         return x
 
     def _recv_backward(self) -> Optional[torch.Tensor]:
         if self.pp.is_last:
             return None
-        g = torch.empty(self.act_shape)
+        g = torch.empty(self.act_shape, dtype=self.act_dtype)
         _exchange([(g, self.pp.next_rank)], [])
         return g
 
@@ -85,14 +88,14 @@ class Pipeline1F1B:
     def _send_forward_recv_backward(self, out: torch.Tensor) -> Optional[torch.Tensor]:
         if self.pp.is_last:
             return None
-        g = torch.empty(self.act_shape)
+        g = torch.empty(self.act_shape, dtype=self.act_dtype)
         _exchange([(g, self.pp.next_rank)], [(out.detach(), self.pp.next_rank)])
         return g
 
     def _send_backward_recv_forward(self, in_grad: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if self.pp.is_first:
             return None
-        x = torch.empty(self.act_shape)
+        x = torch.empty(self.act_shape, dtype=self.act_dtype)
         _exchange([(x, self.pp.prev_rank)], [(in_grad, self.pp.prev_rank)])
         return x
 
@@ -214,6 +217,7 @@ class PipelineInterleaved:
         seq_local = seq_len // model.tp.world if cfg.sequence_parallel else seq_len
         self.act_shape = (micro_batch_size, seq_local, cfg.n_embd)
         self.micro_batch_size = micro_batch_size
+        self.act_dtype = next(model.parameters()).dtype
 
         world = dist.get_world_size()
         everyone = list(range(world))
@@ -232,7 +236,7 @@ class PipelineInterleaved:
         return self.pp.rank == self.pp.world - 1 and c == self.v - 1
 
     def _recv(self, peer: int, group) -> torch.Tensor:
-        x = torch.empty(self.act_shape)
+        x = torch.empty(self.act_shape, dtype=self.act_dtype)
         dist.recv(x, src=peer, group=group)
         return x
 

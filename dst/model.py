@@ -274,7 +274,10 @@ class GPT(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+            # Loss in fp32 regardless of model dtype (no-op when fp32).
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1)
+            )
         return logits, loss
 
 
@@ -362,7 +365,9 @@ class GPTStage(nn.Module):
         logits = self.lm_head(x)[..., : self.config.vocab_size]
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1)
+            )
         return logits, loss
 
 
