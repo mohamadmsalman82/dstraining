@@ -35,6 +35,8 @@ from dst.pipeline import Pipeline1F1B, PipelineInterleaved
 
 from test_tp_correctness import check, ref_slice, SEED, ATOL
 
+DEVICE = torch.device("cpu")  # set in main; cuda under NCCL
+
 
 def log(msg):
     if dist.get_rank() == 0:
@@ -67,9 +69,12 @@ def main():
     parser.add_argument("--sp", action="store_true")
     parser.add_argument("--chunks", type=int, default=1, help="model chunks per rank (v>1: interleaved)")
     parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--device", default=None, help="cuda|cpu (default: cuda if available)")
     args = parser.parse_args()
 
     parallel.init_distributed()
+    global DEVICE
+    DEVICE = torch.device(args.device) if args.device else parallel.default_device()
     torch.manual_seed(SEED)
     tp, pp, _ = parallel.make_topology(args.tp, args.pp)
 
@@ -88,17 +93,17 @@ def main():
         f"layers={args.layers}, batch={B}, micro={args.micro} "
         f"({n_micro} microbatches), fp32, cpu\n")
 
-    model_ref = GPT(cfg, parallel.SINGLE, seed=SEED)
+    model_ref = GPT(cfg, parallel.SINGLE, seed=SEED).to(DEVICE)
     if args.chunks > 1:
-        stage = GPTChunks(cfg, tp, pp, v=args.chunks, seed=SEED)
+        stage = GPTChunks(cfg, tp, pp, v=args.chunks, seed=SEED).to(DEVICE)
         pipe = PipelineInterleaved(stage, pp, micro_batch_size=args.micro, seq_len=cfg.block_size)
     else:
-        stage = GPTStage(cfg, tp, pp, seed=SEED)
+        stage = GPTStage(cfg, tp, pp, seed=SEED).to(DEVICE)
         pipe = Pipeline1F1B(stage, pp, micro_batch_size=args.micro, seq_len=cfg.block_size)
 
     g = torch.Generator().manual_seed(SEED + 1)
-    idx = torch.randint(0, cfg.vocab_size, (B, cfg.block_size), generator=g)
-    targets = torch.randint(0, cfg.vocab_size, (B, cfg.block_size), generator=g)
+    idx = torch.randint(0, cfg.vocab_size, (B, cfg.block_size), generator=g).to(DEVICE)
+    targets = torch.randint(0, cfg.vocab_size, (B, cfg.block_size), generator=g).to(DEVICE)
 
     ok = True
 
@@ -158,7 +163,7 @@ def main():
         log(f"  [{'PASS' if within else 'FAIL'}] rank0 peak in-flight "
             f"{pipe.peak_in_flight} <= warmup+1 = {bound}")
 
-    verdict = torch.tensor(0 if ok else 1)
+    verdict = torch.tensor(0 if ok else 1, device=DEVICE)
     dist.all_reduce(verdict)
     log("\nALL PASS" if verdict.item() == 0 else "\nFAILED")
     dist.destroy_process_group()

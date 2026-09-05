@@ -91,7 +91,16 @@ def init_distributed(backend: Optional[str] = None) -> None:
     else:
         dist.init_process_group(backend=backend)
     if torch.cuda.is_available():
-        torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
+        # LOCAL_RANK is torchrun's per-node rank; correct under multi-node
+        # where global rank % device_count would collide.
+        local = int(os.environ.get("LOCAL_RANK", dist.get_rank() % torch.cuda.device_count()))
+        torch.cuda.set_device(local)
+
+
+def default_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
 
 
 def make_tp_context(tp_size: Optional[int] = None) -> TPContext:

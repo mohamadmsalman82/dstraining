@@ -47,6 +47,7 @@ from dst.model import GPT, GPTConfig
 
 ATOL = 1e-5
 SEED = 1234
+DEVICE = torch.device("cpu")  # set in main; cuda under NCCL
 
 
 def log(tp, msg):
@@ -67,9 +68,9 @@ def test_conjugacy(tp):
     log(tp, "conjugacy: f / f-bar on a column+row split MLP")
     g = torch.Generator().manual_seed(SEED)
     n, h = 8, 16
-    X = torch.randn(4, n, generator=g, requires_grad=True)
-    A = torch.randn(n, h, generator=g, requires_grad=True)
-    B = torch.randn(h, n, generator=g, requires_grad=True)
+    X = torch.randn(4, n, generator=g).to(DEVICE).requires_grad_(True)
+    A = torch.randn(n, h, generator=g).to(DEVICE).requires_grad_(True)
+    B = torch.randn(h, n, generator=g).to(DEVICE).requires_grad_(True)
 
     # Reference: unsplit.
     Z_ref = F.gelu(X @ A) @ B
@@ -98,9 +99,9 @@ def test_sp_conjugacy(tp):
     log(tp, "conjugacy: g / g-bar on a sequence-sharded column+row split")
     g = torch.Generator().manual_seed(SEED)
     b, s, n, h = 2, 8, 6, 12
-    X = torch.randn(b, s, n, generator=g, requires_grad=True)
-    A = torch.randn(n, h, generator=g, requires_grad=True)
-    B = torch.randn(h, n, generator=g, requires_grad=True)
+    X = torch.randn(b, s, n, generator=g).to(DEVICE).requires_grad_(True)
+    A = torch.randn(n, h, generator=g).to(DEVICE).requires_grad_(True)
+    B = torch.randn(h, n, generator=g).to(DEVICE).requires_grad_(True)
 
     Z_ref = F.gelu(X @ A) @ B
     Z_ref.sum().backward()
@@ -145,15 +146,15 @@ def build_models(cfg, tp, recompute=False):
 
     # Recompute goes on the parallel model only; the reference keeps every
     # activation, so the comparison cross-validates the recompute path too.
-    model_tp = GPT(replace(cfg, recompute_attention=recompute), tp, seed=SEED)
-    model_ref = GPT(cfg, parallel.SINGLE, seed=SEED)
+    model_tp = GPT(replace(cfg, recompute_attention=recompute), tp, seed=SEED).to(DEVICE)
+    model_ref = GPT(cfg, parallel.SINGLE, seed=SEED).to(DEVICE)
     return model_tp, model_ref
 
 
 def make_batch(cfg, g):
     idx = torch.randint(0, cfg.vocab_size, (4, cfg.block_size), generator=g)
     targets = torch.randint(0, cfg.vocab_size, (4, cfg.block_size), generator=g)
-    return idx, targets
+    return idx.to(DEVICE), targets.to(DEVICE)
 
 
 def test_model(tp, model_tp, model_ref, cfg):
@@ -251,9 +252,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sp", action="store_true", help="enable sequence parallelism")
     parser.add_argument("--recompute", action="store_true", help="selective recompute on the TP model")
+    parser.add_argument("--device", default=None, help="cuda|cpu (default: cuda if available)")
     args = parser.parse_args()
 
     parallel.init_distributed()
+    global DEVICE
+    DEVICE = torch.device(args.device) if args.device else parallel.default_device()
     torch.manual_seed(SEED)  # dropout etc.; the suite runs with dropout=0
     tp = parallel.make_tp_context()
 
@@ -278,7 +282,7 @@ def main():
     ok &= test_training(tp, model_tp, model_ref, cfg)
 
     # All ranks must agree on the verdict.
-    verdict = torch.tensor(0 if ok else 1)
+    verdict = torch.tensor(0 if ok else 1, device=DEVICE)
     dist.all_reduce(verdict)
     log(tp, "\nALL PASS" if verdict.item() == 0 else "\nFAILED")
     dist.destroy_process_group()

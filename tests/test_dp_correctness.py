@@ -34,6 +34,8 @@ from dst.pipeline import Pipeline1F1B, PipelineInterleaved
 
 from test_tp_correctness import ref_slice, SEED, ATOL
 
+DEVICE = torch.device("cpu")  # set in main; cuda under NCCL
+
 
 def log(msg):
     if dist.get_rank() == 0:
@@ -48,9 +50,12 @@ def main():
     parser.add_argument("--micro", type=int, default=1)
     parser.add_argument("--sp", action="store_true")
     parser.add_argument("--chunks", type=int, default=1)
+    parser.add_argument("--device", default=None, help="cuda|cpu (default: cuda if available)")
     args = parser.parse_args()
 
     parallel.init_distributed()
+    global DEVICE
+    DEVICE = torch.device(args.device) if args.device else parallel.default_device()
     torch.manual_seed(SEED)
     tp, pp, dp = parallel.make_topology(args.tp, args.pp, args.dp)
 
@@ -68,21 +73,21 @@ def main():
     log(f"dp={args.dp}, tp={args.tp}, pp={args.pp}, chunks={args.chunks}, "
         f"sp={args.sp}, global batch={B_global}, local={B_local}, fp32, cpu\n")
 
-    model_ref = GPT(cfg, parallel.SINGLE, seed=SEED)
+    model_ref = GPT(cfg, parallel.SINGLE, seed=SEED).to(DEVICE)
     pipelined = args.pp > 1
     if args.chunks > 1:
-        model = GPTChunks(cfg, tp, pp, v=args.chunks, seed=SEED)
+        model = GPTChunks(cfg, tp, pp, v=args.chunks, seed=SEED).to(DEVICE)
         pipe = PipelineInterleaved(model, pp, micro_batch_size=args.micro, seq_len=cfg.block_size)
     elif pipelined:
-        model = GPTStage(cfg, tp, pp, seed=SEED)
+        model = GPTStage(cfg, tp, pp, seed=SEED).to(DEVICE)
         pipe = Pipeline1F1B(model, pp, micro_batch_size=args.micro, seq_len=cfg.block_size)
     else:
-        model = GPT(cfg, tp, seed=SEED)
+        model = GPT(cfg, tp, seed=SEED).to(DEVICE)
         pipe = None
 
     g = torch.Generator().manual_seed(SEED + 1)
-    idx = torch.randint(0, cfg.vocab_size, (B_global, cfg.block_size), generator=g)
-    targets = torch.randint(0, cfg.vocab_size, (B_global, cfg.block_size), generator=g)
+    idx = torch.randint(0, cfg.vocab_size, (B_global, cfg.block_size), generator=g).to(DEVICE)
+    targets = torch.randint(0, cfg.vocab_size, (B_global, cfg.block_size), generator=g).to(DEVICE)
     my_idx = idx[dp.rank * B_local : (dp.rank + 1) * B_local]
     my_tgt = targets[dp.rank * B_local : (dp.rank + 1) * B_local]
 
@@ -157,7 +162,7 @@ def main():
             print(f"  [{'PASS' if last < first else 'FAIL'}] loss falls: "
                   f"{first:.4f} -> {last:.4f}", flush=True)
 
-    verdict = torch.tensor(0 if ok else 1)
+    verdict = torch.tensor(0 if ok else 1, device=DEVICE)
     dist.all_reduce(verdict)
     log("\nALL PASS" if verdict.item() == 0 else "\nFAILED")
     dist.destroy_process_group()

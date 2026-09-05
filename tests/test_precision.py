@@ -19,6 +19,8 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import argparse
+
 import torch
 import torch.distributed as dist
 
@@ -28,6 +30,7 @@ from dst.precision import MasterWeightOptimizer
 
 SEED = 1234
 STEPS = 30
+DEVICE = torch.device("cpu")  # set in main; cuda under NCCL
 
 
 def log(msg):
@@ -49,26 +52,32 @@ def train(model, opt, idx, targets, finalize=None):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default=None, help="cuda|cpu (default: cuda if available)")
+    args = parser.parse_args()
+
     parallel.init_distributed()
+    global DEVICE
+    DEVICE = torch.device(args.device) if args.device else parallel.default_device()
     tp = parallel.make_tp_context()
     cfg = GPTConfig(vocab_size=512, block_size=64, n_layer=4, n_head=8, n_embd=128, dropout=0.0)
     g = torch.Generator().manual_seed(SEED + 1)
-    idx = torch.randint(0, cfg.vocab_size, (4, cfg.block_size), generator=g)
-    targets = torch.randint(0, cfg.vocab_size, (4, cfg.block_size), generator=g)
+    idx = torch.randint(0, cfg.vocab_size, (4, cfg.block_size), generator=g).to(DEVICE)
+    targets = torch.randint(0, cfg.vocab_size, (4, cfg.block_size), generator=g).to(DEVICE)
     log(f"tp={tp.world}, {STEPS} steps on a fixed batch\n")
     ok = True
 
     # fp32 baseline.
-    model32 = GPT(cfg, tp, seed=SEED)
+    model32 = GPT(cfg, tp, seed=SEED).to(DEVICE)
     fp32 = train(model32, torch.optim.Adam(model32.parameters(), lr=1e-3), idx, targets)
 
     # bf16 + fp32 masters.
-    model16 = GPT(cfg, tp, seed=SEED).to(torch.bfloat16)
+    model16 = GPT(cfg, tp, seed=SEED).to(DEVICE).to(torch.bfloat16)
     opt = MasterWeightOptimizer(model16.parameters(), lr=1e-3)
     bf16 = train(model16, opt, idx, targets)
 
     # bf16 with updates applied in bf16 (the failure mode).
-    model_bad = GPT(cfg, tp, seed=SEED).to(torch.bfloat16)
+    model_bad = GPT(cfg, tp, seed=SEED).to(DEVICE).to(torch.bfloat16)
     bad = train(model_bad, torch.optim.Adam(model_bad.parameters(), lr=1e-3), idx, targets)
 
     fell = bf16[-1] < bf16[0] - 1.0
@@ -107,7 +116,7 @@ def main():
         ok &= d == 0.0
         log(f"  [{'PASS' if d == 0.0 else 'FAIL'}] cross-rank logit identity in bf16: {d:.1e}")
 
-    verdict = torch.tensor(0 if ok else 1)
+    verdict = torch.tensor(0 if ok else 1, device=DEVICE)
     dist.all_reduce(verdict)
     log("\nALL PASS" if verdict.item() == 0 else "\nFAILED")
     dist.destroy_process_group()

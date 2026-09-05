@@ -51,6 +51,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--log-every", type=int, default=1)
+    p.add_argument("--device", default=None, help="cuda|cpu (default: cuda if available)")
     return p.parse_args()
 
 
@@ -58,6 +59,7 @@ def main():
     args = parse_args()
     parallel.init_distributed()
     tp, pp, dp = parallel.make_topology(args.tp, args.pp, args.dp)
+    device = torch.device(args.device) if args.device else parallel.default_device()
 
     if args.gpt2:
         args.layers, args.heads, args.embd, args.block, args.vocab = 12, 12, 768, 1024, 50257
@@ -78,6 +80,7 @@ def main():
         model = GPTStage(cfg, tp, pp, seed=args.seed)
     else:
         model = GPT(cfg, tp, seed=args.seed)
+    model = model.to(device)
     if args.bf16:
         model = model.to(torch.bfloat16)
 
@@ -103,8 +106,9 @@ def main():
     if is_logger:
         print(
             f"tp={args.tp} pp={args.pp} dp={args.dp} chunks={args.chunks} "
-            f"sp={args.sp} recompute={args.recompute} bf16={args.bf16} | "
-            f"{n_params:,} params this rank | batch {args.batch}/replica",
+            f"sp={args.sp} recompute={args.recompute} bf16={args.bf16} "
+            f"device={device.type} | {n_params:,} params this rank | "
+            f"batch {args.batch}/replica",
             flush=True,
         )
 
@@ -113,6 +117,7 @@ def main():
     for step in range(args.steps):
         opt.zero_grad(set_to_none=True)
         idx, targets = shard.get_batch(step)
+        idx, targets = idx.to(device), targets.to(device)
         if pipe is not None:
             loss = pipe.train_step(idx, targets)
         else:
