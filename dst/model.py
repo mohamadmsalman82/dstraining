@@ -66,6 +66,7 @@ import torch.nn.functional as F
 from .parallel import TPContext, PPContext, PP_SINGLE
 from .layers import ColumnParallelLinear, RowParallelLinear
 from .ops import scatter_along_seq
+from .recompute import recompute
 
 VOCAB_PAD_MULTIPLE = 128
 
@@ -85,6 +86,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     sequence_parallel: bool = False
+    recompute_attention: bool = False  # selective recompute of core attention
 
 
 def _pad_vocab(vocab_size: int) -> int:
@@ -95,11 +97,28 @@ def _gen(seed: int, component: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed * 1000003 + component)
 
 
+def core_attention(q, k, v):
+    """softmax(QK^T / sqrt(d)) V with a causal mask, materialized the way
+    pre-FlashAttention kernels do it: the s x s attention matrix and its
+    softmax exist as real tensors (activations scaling as s^2*b*a). That is
+    deliberate — selective recompute exists to discard exactly these, so the
+    framework must actually allocate them. Deterministic and RNG-free, which
+    recompute() requires."""
+    d = q.shape[-1]
+    att = (q @ k.transpose(-2, -1)) / math.sqrt(d)
+    T = att.shape[-1]
+    mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=att.device), diagonal=1)
+    att = att.masked_fill(mask, float("-inf"))
+    att = F.softmax(att, dim=-1)
+    return att @ v
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: GPTConfig, tp: TPContext, generator: torch.Generator):
         super().__init__()
         if config.n_head % tp.world != 0:
             raise ValueError(f"n_head {config.n_head} not divisible by tp {tp.world}")
+        self.config = config
         self.tp = tp
         self.n_head_local = config.n_head // tp.world
         self.head_dim = config.n_embd // config.n_head
@@ -135,7 +154,10 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, h, d).transpose(1, 2)
         k = self.k(x).view(B, T, h, d).transpose(1, 2)
         v = self.v(x).view(B, T, h, d).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.config.recompute_attention:
+            y = recompute(core_attention, q, k, v)
+        else:
+            y = core_attention(q, k, v)
         y = y.transpose(1, 2).contiguous().view(B, T, h * d)
         return self.dropout(self.proj(y))
 

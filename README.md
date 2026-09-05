@@ -17,7 +17,7 @@ kernel would expand surface area without adding insight.
 - [x] **Sequence parallelism**
 - [x] **1F1B pipeline parallelism** (composes with TP and SP)
 - [x] **Interleaved pipeline schedule**
-- [ ] Selective activation recompute
+- [x] **Selective activation recompute**
 - [ ] Data parallelism on top; benchmark against Megatron-LM
 
 ## How tensor parallelism works here
@@ -136,6 +136,29 @@ Two implementation choices worth noting (`PipelineInterleaved`):
   warmup depth — the property that separates 1F1B from naive
   all-forward-then-all-backward.
 
+## Selective recompute
+
+Core attention — `softmax(QKᵀ/√d)·V` — is written by hand and materializes
+the `s×s` attention matrix the way pre-FlashAttention kernels do. That is
+deliberate: those tensors are the `s²·b·a`-scaling activations selective
+recompute exists to discard, so the framework must actually allocate them
+(SDPA would silently never create them and there'd be nothing to measure).
+
+`recompute()` (`dst/recompute.py`) is a 30-line custom autograd Function,
+not `torch.utils.checkpoint`: forward runs the region under `no_grad`
+saving only q/k/v (alive in the surrounding graph anyway), backward
+re-runs it and backpropagates through the fresh subgraph. Requires the
+region to be deterministic and RNG-free, which core attention here is.
+
+The test measures what autograd actually stashes via
+`saved_tensors_hooks`: with `recompute_attention` on, saved-for-backward
+bytes drop by the analytic `2·s²·b·a` attention-matrix term (4,210,688
+observed vs 4,194,304 predicted for the test config), gradients are
+bitwise identical, and the region runs exactly twice per layer per
+microbatch. The TP suite's `--recompute` flag puts recompute on the
+parallel model only, so every comparison against the full-activation
+reference cross-validates it under TP and SP too.
+
 ## Layout
 
 ```
@@ -144,6 +167,7 @@ dst/ops.py        f/f̄ (TP), g/ḡ + scatter (SP), vocab gather — all collect
 dst/layers.py     ColumnParallelLinear, RowParallelLinear
 dst/model.py      GPT-2 from scratch: GPT, GPTStage (one stage), GPTChunks (v chunks)
 dst/pipeline.py   1F1B and interleaved schedules, p2p activation/gradient exchange
+dst/recompute.py  selective activation recompute (custom autograd Function)
 tests/            numerical correctness suites
 scripts/          launchers
 ```
@@ -163,7 +187,10 @@ hang on DNS — the local launcher uses a FileStore instead):
 scripts/launch_local.sh 2 tests/test_tp_correctness.py
 ```
 
-Add `--sp` to run the same suite with sequence parallelism enabled.
+Add `--sp` to run the same suite with sequence parallelism enabled, and
+`--recompute` to enable selective recompute on the parallel model only.
+The recompute memory/equivalence test is single-process:
+`python3 tests/test_recompute.py`.
 
 The pipeline suite composes all three axes; TP degree × PP degree must
 equal the process count:

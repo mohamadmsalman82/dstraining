@@ -140,8 +140,12 @@ def ref_slice(tp_model, name, p_tp, ref_tensor, tp):
     raise AssertionError(f"unexpected sharded param {name}")
 
 
-def build_models(cfg, tp):
-    model_tp = GPT(cfg, tp, seed=SEED)
+def build_models(cfg, tp, recompute=False):
+    from dataclasses import replace
+
+    # Recompute goes on the parallel model only; the reference keeps every
+    # activation, so the comparison cross-validates the recompute path too.
+    model_tp = GPT(replace(cfg, recompute_attention=recompute), tp, seed=SEED)
     model_ref = GPT(cfg, parallel.SINGLE, seed=SEED)
     return model_tp, model_ref
 
@@ -246,6 +250,7 @@ def test_seq_sharding(tp, model_tp, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sp", action="store_true", help="enable sequence parallelism")
+    parser.add_argument("--recompute", action="store_true", help="selective recompute on the TP model")
     args = parser.parse_args()
 
     parallel.init_distributed()
@@ -261,12 +266,12 @@ def main():
         dropout=0.0,
         sequence_parallel=args.sp,
     )
-    log(tp, f"tp={tp.world}, sp={args.sp}, fp32, cpu, config={cfg}\n")
+    log(tp, f"tp={tp.world}, sp={args.sp}, recompute={args.recompute}, fp32, cpu, config={cfg}\n")
 
     ok = test_conjugacy(tp)
     if args.sp:
         ok &= test_sp_conjugacy(tp)
-    model_tp, model_ref = build_models(cfg, tp)
+    model_tp, model_ref = build_models(cfg, tp, recompute=args.recompute)
     if args.sp and tp.enabled:
         ok &= test_seq_sharding(tp, model_tp, cfg)
     ok &= test_model(tp, model_tp, model_ref, cfg)
