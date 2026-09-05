@@ -141,8 +141,8 @@ def ref_slice(tp_model, name, p_tp, ref_tensor, tp):
 
 
 def build_models(cfg, tp):
-    model_tp = GPT(cfg, tp, generator=torch.Generator().manual_seed(SEED))
-    model_ref = GPT(cfg, parallel.SINGLE, generator=torch.Generator().manual_seed(SEED))
+    model_tp = GPT(cfg, tp, seed=SEED)
+    model_ref = GPT(cfg, parallel.SINGLE, seed=SEED)
     return model_tp, model_ref
 
 

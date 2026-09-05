@@ -1,10 +1,18 @@
-"""Process-group setup and tensor-parallel topology.
+"""Process-group setup and parallel topology.
 
 A TPContext describes one tensor-parallel group: the NCCL/gloo process
 group handle, this rank's position inside it, and its size. Layers take a
 TPContext at construction and never touch global state, so a model built
 with SINGLE (world=1) is plain PyTorch — that is what the correctness
 suite compares against.
+
+A PPContext describes this rank's pipeline stage and its neighbors as
+GLOBAL ranks (p2p ops address global ranks; no group handle needed).
+
+Rank layout: rank = pp_rank * tp_size + tp_rank. TP varies fastest, so a
+TP group is consecutive ranks (same node over NVLink under standard
+torchrun placement — TP traffic is the bandwidth-hungry kind), and a
+pipeline neighbor is the corresponding TP rank tp_size away.
 """
 
 import os
@@ -29,6 +37,25 @@ class TPContext:
 
 # A null context: tp of size 1, no collectives ever issued.
 SINGLE = TPContext(group=None, rank=0, world=1)
+
+
+@dataclass(frozen=True)
+class PPContext:
+    rank: int  # stage index
+    world: int  # number of stages
+    prev_rank: Optional[int]  # global rank holding the previous stage
+    next_rank: Optional[int]  # global rank holding the next stage
+
+    @property
+    def is_first(self) -> bool:
+        return self.rank == 0
+
+    @property
+    def is_last(self) -> bool:
+        return self.rank == self.world - 1
+
+
+PP_SINGLE = PPContext(rank=0, world=1, prev_rank=None, next_rank=None)
 
 
 def init_distributed(backend: Optional[str] = None) -> None:
@@ -85,3 +112,22 @@ def make_tp_context(tp_size: Optional[int] = None) -> TPContext:
             ctx = TPContext(group=group, rank=rank - start, world=tp_size)
     assert ctx is not None
     return ctx
+
+
+def make_topology(tp_size: int = 1, pp_size: int = 1):
+    """Decompose the world into (tp, pp) contexts: rank = pp_rank * tp + tp_rank."""
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    if tp_size * pp_size != world:
+        raise ValueError(f"tp {tp_size} * pp {pp_size} != world {world}")
+
+    tp = make_tp_context(tp_size)
+
+    pp_rank = rank // tp_size
+    pp = PPContext(
+        rank=pp_rank,
+        world=pp_size,
+        prev_rank=rank - tp_size if pp_rank > 0 else None,
+        next_rank=rank + tp_size if pp_rank < pp_size - 1 else None,
+    )
+    return tp, pp

@@ -15,7 +15,7 @@ kernel would expand surface area without adding insight.
 
 - [x] **Tensor parallelism** with a numerical correctness suite
 - [x] **Sequence parallelism**
-- [ ] 1F1B pipeline parallelism
+- [x] **1F1B pipeline parallelism** (composes with TP and SP)
 - [ ] Interleaved pipeline schedule
 - [ ] Selective activation recompute
 - [ ] Data parallelism on top; benchmark against Megatron-LM
@@ -78,14 +78,46 @@ gloo has no native reduce-scatter, so the CPU path emulates it with
 all-reduce + slice (same result, an all-gather's worth of extra bandwidth);
 NCCL uses the real `reduce_scatter_tensor`.
 
+## How pipeline parallelism works here
+
+The model splits by layer into `GPTStage`s: embeddings on the first stage,
+`ln_f` + LM head + loss on the last, a contiguous slice of blocks on each.
+Ranks lay out as `rank = pp_rank · tp_size + tp_rank`, so a TP group is
+consecutive ranks (one node over NVLink on real hardware) and a pipeline
+neighbor is the corresponding TP rank `tp_size` away.
+
+The schedule (`dst/pipeline.py`) is 1F1B: after a warmup of `p − 1 − stage`
+forwards, each stage alternates one-forward-one-backward, capping in-flight
+activations at `p − stage` microbatches regardless of `m`. The bubble
+fraction is `(p−1)/m`; interleaving (next milestone) improves it to
+`(p−1)/(m·v)`.
+
+Autograd doesn't span processes, so each stage stashes `(input, output)`
+pairs for its in-flight microbatches; backward receives `∂loss/∂output` from
+downstream, runs autograd over the local segment, and ships `∂loss/∂input`
+upstream. Per-microbatch losses are scaled by `1/m`, so the accumulated
+gradients equal the full-batch gradient — the suite checks them to ~1e-8.
+Each schedule step's sends and receives are posted as one
+`batch_isend_irecv`, which is what keeps the steady state deadlock-free
+(a blocking send can't wait on a recv that hasn't been posted). Activation
+shapes are static per config, so there's no shape handshake; under SP the
+boundary tensors are sequence-sharded, so p2p volume divides by `tp` too.
+
+Init is invariant to the pipeline split as well: every component (each
+block, each embedding, the head) draws from its own generator seeded by
+`(base seed, component id)`, so a stage that builds only its layers gets
+bit-identical weights to the full model — same trick that makes TP init
+slice-exact, extended to the layer axis.
+
 ## Layout
 
 ```
-dst/parallel.py   process groups and TP topology (TPContext)
+dst/parallel.py   process groups and topology (TPContext, PPContext)
 dst/ops.py        f/f̄ (TP), g/ḡ + scatter (SP), vocab gather — all collectives
 dst/layers.py     ColumnParallelLinear, RowParallelLinear
-dst/model.py      GPT-2 from scratch, TP-aware
-tests/            numerical correctness suite
+dst/model.py      GPT-2 from scratch: GPT (whole model), GPTStage (one stage)
+dst/pipeline.py   1F1B schedule and p2p activation/gradient exchange
+tests/            numerical correctness suites
 scripts/          launchers
 ```
 
@@ -106,7 +138,19 @@ scripts/launch_local.sh 2 tests/test_tp_correctness.py
 
 Add `--sp` to run the same suite with sequence parallelism enabled.
 
-TP degree = number of processes. The suite checks, in fp32:
+The pipeline suite composes all three axes; TP degree × PP degree must
+equal the process count:
+
+```
+scripts/launch_local.sh 2 tests/test_pp_correctness.py --pp 2 --micro 1
+scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 4 --micro 1
+scripts/launch_local.sh 4 tests/test_pp_correctness.py --pp 2 --tp 2 --micro 1 --sp
+```
+
+It checks the pipelined microbatched loss, every accumulated gradient, and
+a 5-step Adam trajectory against the full-batch single-process reference.
+
+For the TP suite, TP degree = number of processes. The suite checks, in fp32:
 conjugacy of `f`/`f̄` (and `g`/`ḡ` under `--sp`) on a toy split,
 shard-vs-slice init identity, sequence sharding of LayerNorm regions,
 forward logits vs the reference and across ranks, every gradient shard vs
