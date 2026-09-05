@@ -225,6 +225,14 @@ class PipelineInterleaved:
         everyone = list(range(world))
         self.fwd_ch = [dist.new_group(everyone) for _ in range(self.v)]
         self.bwd_ch = [dist.new_group(everyone) for _ in range(self.v)]
+        # NCCL creates a group's communicator collectively on FIRST use, so a
+        # pair-wise p2p as the first op on a channel would wait forever for
+        # the group's other ranks (gloo has no such init step — this only
+        # bites on GPUs, and only when tp/dp > 1 changes which ranks touch a
+        # channel when). Warm each channel now, while every rank is here.
+        warm = torch.zeros(1, device=self.act_device)
+        for g in self.fwd_ch + self.bwd_ch:
+            dist.all_reduce(warm, group=g)
 
         self.ring_next = pp.ring_next_rank
         self.ring_prev = pp.ring_prev_rank
